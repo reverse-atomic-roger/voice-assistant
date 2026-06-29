@@ -1,6 +1,8 @@
 # Voice Assistant
 Voice assistant was created to be a private, open source alternative to Google Home, Alexa, etc. As such it has no cloud/service provider dependencies beyond PyPi for library installs. It aims to be modular, so that each main component can run on its own server, or all parts can run on one machine. Components can be swapped out with custom code while leaving the rest of the system intact. New skills can be added by writing new python modules and registering them with the intent handler.
 
+Written with some help and some hinderance from the Claude LLM (Free tier, Claude 4.6 Sonnet, High Effort)
+
 ## Privacy through Local Processing
 Voice Assistant uses OpenWakeWord for wake word detection, faster-whisper for Speech-to-Text (STT), a local LLM (running in Ollama) for intent extraction and Piper for Text-to-Speech (TTS). All these services can run on a single machine, or on dedicated hardware on your network. No external resources are required.
 
