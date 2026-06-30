@@ -156,11 +156,90 @@ def load_earcons() -> None:
 
 
 # ---------------------------------------------------------------------------
+# VAD-gated capture
+# ---------------------------------------------------------------------------
+
+async def _capture_and_stream(
+    vad: "SileroVAD",
+    silence_frames_needed: int,
+    max_capture_frames: int,
+    VAD_CHUNK_BYTES: int,
+) -> None:
+    """
+    Run one VAD-gated capture cycle and stream the result to the STT server.
+
+    Reads OWW-sized frames from the mic queue, accumulates them into 512-sample
+    VAD chunks (converting int16 → float32 on the way), and stops when
+    silence_frames_needed consecutive silent frames follow detected speech, or
+    max_capture_frames is reached. Then sends the full capture over Wyoming.
+
+    Plays the end earcon on success. Logs a warning and skips the earcon if
+    the Wyoming send fails — the capture data is lost but the loop continues.
+
+    Called both from the wake-word path and the prompted-listen path, so the
+    start earcon is the caller's responsibility (the two paths use it
+    differently).
+    """
+    captured: list[bytes] = []
+    vad_buf = bytearray()
+    consecutive_silence = 0
+    speech_started = False
+
+    for _ in range(max_capture_frames):
+        frame = await audio_io.capture_queue().get()
+        captured.append(frame)
+        vad_buf.extend(frame)
+
+        while len(vad_buf) >= VAD_CHUNK_BYTES:
+            chunk_i16 = np.frombuffer(vad_buf[:VAD_CHUNK_BYTES], dtype=np.int16)
+            del vad_buf[:VAD_CHUNK_BYTES]
+            chunk_f32 = (chunk_i16.astype(np.float32) / 32768.0).tobytes()
+
+            is_speech = vad.process(chunk_f32) >= VAD_THRESHOLD
+
+            if is_speech:
+                speech_started = True
+                consecutive_silence = 0
+            elif speech_started:
+                consecutive_silence += 1
+
+        # Don't start the silence countdown until speech has begun —
+        # there's often a short pause between the wake word and the command.
+        if speech_started and consecutive_silence >= silence_frames_needed:
+            log.debug("Silence detected after %d frames — ending stream", len(captured))
+            break
+    else:
+        log.warning(
+            "Hit max stream duration (%.1fs) without silence — sending anyway",
+            MAX_STREAM_SECONDS,
+        )
+
+    log.debug(
+        "Captured %d frames (%.2fs), sending to %s",
+        len(captured),
+        len(captured) * OWW_FRAME_SAMPLES / SAMPLE_RATE,
+        TARGET_URI,
+    )
+    try:
+        await send_audio_stream(captured)
+        end_pcm, end_rate = _END_SOUND
+        await audio_io.play_pcm(end_pcm, end_rate, width=4, channels=1)
+    except OSError as exc:
+        log.error("Failed to send Wyoming stream: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
 async def run() -> None:
-    """Continuously detect wake word, then stream audio until silence."""
+    """Continuously detect wake word, then stream audio until silence.
+
+    If audio_io.listen_after is set (by audio_receiver when the orchestrator
+    signals it expects a reply), one capture cycle runs immediately without
+    requiring a wake word. The start earcon is replaced by a softer prompt
+    tone to indicate the mic is open for a follow-up.
+    """
 
     log.info("Loading openwakeword model (%s)...", WAKE_WORDS)
     openwakeword.utils.download_models()
@@ -193,6 +272,25 @@ async def run() -> None:
     _last_heartbeat: float = 0.0
 
     while True:
+        # --- prompted listen check ---------------------------------------
+        # Check before the wake word phase. If the orchestrator has asked a
+        # clarifying question and set listen_after, skip straight to capture.
+        # Clear the event immediately so a slow user doesn't trigger twice.
+        if audio_io.listen_after.is_set():
+            audio_io.listen_after.clear()
+            log.info("Prompted listen — capturing reply without wake word")
+
+            # Use the start earcon so the user knows the mic is open.
+            # (Same sound as wake word activation — consistent UX.)
+            start_pcm, start_rate = _START_SOUND
+            await audio_io.play_pcm(start_pcm, start_rate, width=4, channels=1)
+
+            await _capture_and_stream(vad, silence_frames_needed, max_capture_frames, VAD_CHUNK_BYTES)
+
+            last_detection_time = time.monotonic()
+            log.info("Prompted capture sent. Resuming wake word detection...")
+            continue
+
         # --- wake word detection phase -----------------------------------
         # Heartbeat — log once per HEARTBEAT_INTERVAL so a stalled loop is
         # immediately visible in the logs.
@@ -227,59 +325,7 @@ async def run() -> None:
         start_pcm, start_rate = _START_SOUND
         await audio_io.play_pcm(start_pcm, start_rate, width=4, channels=1)
 
-        # --- VAD-gated capture phase ------------------------------------
-        # Read OWW-sized frames from the mic into a byte accumulation buffer,
-        # draining it into 512-sample chunks for VAD. The mic gives int16;
-        # process() needs float32 normalised to [-1, 1], so we convert on
-        # the way in. Stop once silence_frames_needed consecutive silent
-        # frames are seen, or the hard cap is reached.
-        captured: list[bytes] = []
-        vad_buf = bytearray()
-        consecutive_silence = 0
-        speech_started = False
-
-        for _ in range(max_capture_frames):
-            frame = await audio_io.capture_queue().get()
-            captured.append(frame)
-            vad_buf.extend(frame)
-
-            while len(vad_buf) >= VAD_CHUNK_BYTES:
-                chunk_i16 = np.frombuffer(vad_buf[:VAD_CHUNK_BYTES], dtype=np.int16)
-                del vad_buf[:VAD_CHUNK_BYTES]
-                chunk_f32 = (chunk_i16.astype(np.float32) / 32768.0).tobytes()
-
-                is_speech = vad.process(chunk_f32) >= VAD_THRESHOLD
-
-                if is_speech:
-                    speech_started = True
-                    consecutive_silence = 0
-                elif speech_started:
-                    consecutive_silence += 1
-
-            # Don't start the silence countdown until speech has begun —
-            # there's often a short pause between the wake word and the command.
-            if speech_started and consecutive_silence >= silence_frames_needed:
-                log.debug("Silence detected after %d frames — ending stream", len(captured))
-                break
-        else:
-            log.warning(
-                "Hit max stream duration (%.1fs) without silence — sending anyway",
-                MAX_STREAM_SECONDS,
-            )
-
-        log.debug(
-            "Captured %d frames (%.2fs), sending to %s",
-            len(captured),
-            len(captured) * OWW_FRAME_SAMPLES / SAMPLE_RATE,
-            TARGET_URI,
-        )
-        try:
-            await send_audio_stream(captured)
-
-            end_pcm, end_rate = _END_SOUND
-            await audio_io.play_pcm(end_pcm, end_rate, width=4, channels=1)
-        except OSError as exc:
-            log.error("Failed to send Wyoming stream: %s", exc)
+        await _capture_and_stream(vad, silence_frames_needed, max_capture_frames, VAD_CHUNK_BYTES)
 
         last_detection_time = time.monotonic()  # reset after streaming completes, otherwise oww just reads the next frame and triggers again
         log.info("Stream sent. Listening again...")

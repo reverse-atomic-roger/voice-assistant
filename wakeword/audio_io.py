@@ -34,6 +34,12 @@ This module does not start any loops itself — it is imported by
 wakeword_stream.py and audio_receiver.py, and initialised once by
 satellite_main.py at startup.
 
+The listen_after asyncio.Event is the coordination point for clarification
+prompts. audio_receiver sets it when the orchestrator signals that a reply
+is expected; wakeword_stream clears it and skips the wake word gate when it
+fires. This lets a single wake word activation carry a full multi-turn
+exchange without the user needing to re-trigger.
+
 Dependencies:
     pip install pyaudio numpy
 """
@@ -94,6 +100,17 @@ _capture_thread: threading.Thread | None = None
 
 # Set to signal the capture thread to exit cleanly on shutdown.
 _capture_stop: threading.Event = threading.Event()
+
+# ---------------------------------------------------------------------------
+# Clarification listen trigger
+# ---------------------------------------------------------------------------
+# Set by audio_receiver when the orchestrator sends a listen_after signal.
+# Cleared by wakeword_stream when it begins the prompted capture.
+# asyncio.Event: safe to set/clear from any coroutine; no thread interaction.
+#
+# Created at module level so it exists before init() is called — wakeword_stream
+# and audio_receiver both reference it at import time.
+listen_after: asyncio.Event = asyncio.Event()
 
 
 def capture_queue() -> "asyncio.Queue[bytes]":
