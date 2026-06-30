@@ -31,8 +31,9 @@ Intent JSON schema (produced by small Ollama model):
     }
 
 Supported intents (Phase 1):
-    timer           slots: label (str), duration_seconds (int)
-    list_add        slots: list_name (str), item (str)
+    timer           slots: hours (int, optional), minutes (int, optional),
+                            seconds (int, optional), label (str, optional)
+    list_add        slots: list_name (str), list_items (list[str])
     list_read       slots: list_name (str)
     converse        slots: (none — escalate to large model, not yet implemented)
     unknown         slots: (none — fallback)
@@ -58,6 +59,8 @@ from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.client import AsyncClient
 from wyoming.event import Event, async_read_event, async_write_event
 
+import conversation_state
+from conversation_state import ClarificationNeeded
 import database
 
 # ---------------------------------------------------------------------------
@@ -104,6 +107,8 @@ RESPONSE_FILES = {
 # CONFIGURE: how often the timer poller wakes to check for due timers (seconds).
 # 5 seconds gives acceptable precision without hammering the DB.
 TIMER_POLL_INTERVAL = 5
+
+# Clarification timeout and max turns are configured in conversation_state.py.
 
 # ---------------------------------------------------------------------------
 
@@ -154,21 +159,34 @@ def load_canned_responses() -> None:
 # Audio — send PCM to satellite
 # ---------------------------------------------------------------------------
 
+LISTEN_AFTER_EVENT_TYPE = "listen_after"
+
+
 async def send_audio_to_satellite(
     pcm: bytes,
     sample_rate: int,
     sample_width: int,
     channels: int,
     satellite_ip: str,
+    listen_after: bool = False,
 ) -> None:
     """
     Stream raw PCM bytes to a satellite's Wyoming audio-in server.
     Opens a fresh connection per call so each audio segment is self-contained.
+
+    If listen_after is True, a listen_after event is sent before AudioStart.
+    The satellite's audio_receiver will set audio_io.listen_after after
+    playback, causing wakeword_stream to open the mic immediately for a
+    clarification reply — no wake word needed.
     """
     uri = f"tcp://{satellite_ip}:{SATELLITE_WYOMING_PORT}"
     chunk_size = 4096  # bytes per AudioChunk
 
     async with AsyncClient.from_uri(uri) as client:
+        if listen_after:
+            await client.write_event(Event(type=LISTEN_AFTER_EVENT_TYPE, data={}))
+            log.debug("Sent listen_after signal to %s", satellite_ip)
+
         await client.write_event(
             AudioStart(rate=sample_rate, width=sample_width, channels=channels).event()
         )
@@ -183,7 +201,7 @@ async def send_audio_to_satellite(
             )
         await client.write_event(AudioStop().event())
 
-    log.debug("Sent %d PCM bytes to %s", len(pcm), satellite_ip)
+    log.debug("Sent %d PCM bytes to %s (listen_after=%s)", len(pcm), satellite_ip, listen_after)
 
 
 async def send_canned(key: str, satellite_ip: str) -> None:
@@ -239,7 +257,7 @@ async def synthesize_speech(text: str) -> tuple[bytes, int, int, int]:
         await writer.wait_closed()
 
 
-async def send_to_tts(text: str, satellite_ip: str) -> None:
+async def send_to_tts(text: str, satellite_ip: str, listen_after: bool = False) -> None:
     """
     Synthesise `text` via the TTS service, then deliver the result to the
     satellite once synthesis is complete.
@@ -247,9 +265,12 @@ async def send_to_tts(text: str, satellite_ip: str) -> None:
     Audio always comes back here rather than being sent directly from the TTS
     service — this keeps orchestration in control of playback ordering against
     earcons and other audio already queued for the same satellite.
+
+    If listen_after is True, the satellite opens the mic immediately after
+    playback without requiring a new wake word activation.
     """
     pcm, rate, width, channels = await synthesize_speech(text)
-    await send_audio_to_satellite(pcm, rate, width, channels, satellite_ip)
+    await send_audio_to_satellite(pcm, rate, width, channels, satellite_ip, listen_after=listen_after)
 
 
 # ---------------------------------------------------------------------------
@@ -270,14 +291,26 @@ markdown fences — in this exact shape:
 Supported intents and their required slots:
 
   timer
-    label            (string)  short description of what the timer is for,
-                                omit entirely if user gives no label
-    duration_seconds (integer) total duration in seconds
+    hours    (integer, optional) hours component of the duration, if stated
+    minutes  (integer, optional) minutes component of the duration, if stated
+    seconds  (integer, optional) seconds component of the duration, if stated
+    label    (string, optional)  short description of what the timer is for,
+                                  only if the user actually gave one
+
+    Extract each time unit exactly as the user stated it. Do NOT perform any
+    arithmetic or unit conversion yourself — never convert "2 minutes" into
+    120 seconds, never add units together. Just report the raw number for
+    each unit mentioned; omit a unit (or use 0) if it was not mentioned.
+    If the user did not give the timer a name, omit the label field entirely
+    — do not invent one.
 
   list_add
-    list_name  (string) name of the list (e.g. "shopping", "todo")
-    items      (list[string]) one or more items to add; always a list even for a single item
-
+    list_name   (string)        name of the list (e.g. "shopping", "todo")
+    list_items  (array of string) every item the user wants added. The user
+                                   may mention one item or several in the
+                                   same request — always return a JSON array,
+                                   even for a single item.
+                                   e.g. ["milk"] or ["milk", "bread", "eggs"]
   list_read
     list_name  (string) name of the list to read out
 
@@ -291,6 +324,10 @@ Supported intents and their required slots:
 Rules:
 - Choose exactly one intent.
 - Only include slots defined for that intent.
+- For timer durations, return the numbers exactly as the user stated them —
+  never compute or convert a total yourself.
+- For list_add, always return list_items as a JSON array of strings, even
+  when only one item was mentioned.
 - Do not add commentary or explanation.
 """
 
@@ -350,6 +387,148 @@ def extract_intent(transcript: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Slot filling — used during clarification turns
+# ---------------------------------------------------------------------------
+
+# The slot-fill prompt is deliberately narrow: it only tries to extract one
+# named slot from a short reply. No intent classification happens here — the
+# intent is already known from the pending context.
+#
+# The model is given the slot name and a plain-English description so it
+# knows what to look for. Deterministic post-processing handles all unit
+# conversion (e.g. "three minutes" → 180 seconds) — we only ask the model
+# for the raw value the user stated.
+
+_SLOT_FILL_DESCRIPTIONS: dict[str, str] = {
+    "duration_seconds": (
+        "The duration of the timer as stated by the user. "
+        "Extract hours, minutes, and seconds as separate integer fields. "
+        "Return a JSON object with keys: hours (int), minutes (int), seconds (int). "
+        "Use 0 for any unit not mentioned. Example: '3 minutes' → "
+        '{\"hours\": 0, \"minutes\": 3, \"seconds\": 0}'
+    ),
+    "label": (
+        "A short description of what the timer is for. "
+        "Return a JSON object with key: value (string). "
+        "Example: 'the pasta' → {\"value\": \"pasta\"}"
+    ),
+    "list_name": (
+        "The name of the list. "
+        "Return a JSON object with key: value (string). "
+        "Example: 'the shopping list' → {\"value\": \"shopping\"}"
+    ),
+    "list_items": (
+        "The item(s) the user wants added to the list. There may be one or "
+        "several mentioned in the same reply. "
+        "Return a JSON object with key: value, where value is a JSON array "
+        "of strings — even for a single item. "
+        'Example: "milk and a dozen eggs" → {\"value\": [\"milk\", \"a dozen eggs\"]}'
+    ),
+}
+
+
+def _slot_fill_system_prompt(missing_slot: str) -> str:
+    description = _SLOT_FILL_DESCRIPTIONS.get(
+        missing_slot,
+        f'Extract the value for "{missing_slot}". Return a JSON object with key: value.',
+    )
+    return (
+        "You are a slot extraction engine for a home voice assistant.\n\n"
+        "The user is responding to a clarifying question. "
+        "Extract only the requested value from their reply.\n\n"
+        f"What to extract: {description}\n\n"
+        "Return ONLY a JSON object — no prose, no markdown fences."
+    )
+
+
+def _call_ollama_slot_fill(reply: str, missing_slot: str) -> dict:
+    """
+    Ask the LLM to extract one named slot from a short clarifying reply.
+
+    Returns the raw parsed JSON dict. Raises on network failure, bad JSON,
+    or unexpected response shape — callers handle these.
+    """
+    payload = json.dumps({
+        "model": INTENT_MODEL,
+        "messages": [
+            {"role": "system", "content": _slot_fill_system_prompt(missing_slot)},
+            {"role": "user",   "content": reply},
+        ],
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0.0},
+    }).encode()
+
+    req = urllib.request.Request(
+        f"{OLLAMA_BASE_URL}/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        body = json.loads(resp.read())
+
+    return json.loads(body["message"]["content"])
+
+
+def _merge_slot_from_fill(
+    missing_slot: str,
+    fill_result: dict,
+    existing_slots: dict,
+) -> dict:
+    """
+    Deterministically merge a slot-fill result into the existing slots dict.
+
+    For duration_seconds, the LLM returns {hours, minutes, seconds} separately
+    so we can do the arithmetic here rather than asking the model to multiply.
+    For list_items, the LLM returns {value: [<string>, ...]} since more than
+    one item may be supplied in a single clarifying reply.
+
+    Returns the updated slots dict. Raises ValueError if the fill_result is
+    unusable (e.g. all zeros for a duration, or blank/empty for a name or
+    item list).
+    """
+    slots = dict(existing_slots)  # don't mutate the original
+
+    if missing_slot == "duration_seconds":
+        hours   = int(fill_result.get("hours",   0))
+        minutes = int(fill_result.get("minutes", 0))
+        seconds = int(fill_result.get("seconds", 0))
+        total = hours * 3600 + minutes * 60 + seconds
+        if total <= 0:
+            raise ValueError(
+                f"Duration slot fill returned zero or negative total: {fill_result!r}"
+            )
+        slots["duration_seconds"] = total
+
+    elif missing_slot == "list_items":
+        raw_items = fill_result.get("value", [])
+        if isinstance(raw_items, str):
+            # Model gave a bare string instead of a list — treat it as a
+            # single item rather than discarding a perfectly good reply.
+            raw_items = [raw_items]
+        elif not isinstance(raw_items, list):
+            raw_items = []
+        items = [str(item).strip() for item in raw_items if str(item).strip()]
+        if not items:
+            raise ValueError(
+                f"Slot fill for list_items returned no usable items: {fill_result!r}"
+            )
+        slots["list_items"] = items
+
+    else:
+        value = str(fill_result.get("value", "")).strip()
+        if not value:
+            raise ValueError(
+                f"Slot fill for {missing_slot!r} returned empty value: {fill_result!r}"
+            )
+        slots[missing_slot] = value
+
+    return slots
+
+
+# ---------------------------------------------------------------------------
 # Intent handlers
 # ---------------------------------------------------------------------------
 # Each handler receives the slots dict and the originating satellite IP.
@@ -358,14 +537,44 @@ def extract_intent(transcript: str) -> dict:
 # Raise freely; the dispatcher catches and sends the canned error response.
 # ---------------------------------------------------------------------------
 
-_GENERIC_TIMER_LABEL = "timer"
+def _normalize_timer_duration(slots: dict) -> dict:
+    """
+    Deterministically convert raw hours/minutes/seconds slots (as supplied
+    by the LLM) into a single duration_seconds total.
 
-def _duration_str(seconds: int) -> str:
+    The LLM is explicitly instructed never to do this arithmetic itself —
+    it only ever reports the units the user mentioned. All unit conversion
+    happens here, in plain Python, so a model arithmetic slip can never
+    produce a wrong timer length.
+
+    If none of hours/minutes/seconds are present in `slots` — e.g. these
+    slots already carry a duration_seconds total computed earlier via a
+    completed clarification turn — the slots are returned unchanged.
     """
-    Build a natural spoken duration string from a total number of seconds.
-    e.g. 90 → "1 minute, 30 seconds", 3600 → "1 hour", 3661 → "1 hour, 1 minute, 1 second"
+    if not any(key in slots for key in ("hours", "minutes", "seconds")):
+        return slots
+
+    slots = dict(slots)  # don't mutate the caller's dict
+
+    def _as_int(value) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    hours = _as_int(slots.pop("hours", 0))
+    minutes = _as_int(slots.pop("minutes", 0))
+    seconds = _as_int(slots.pop("seconds", 0))
+
+    slots["duration_seconds"] = hours * 3600 + minutes * 60 + seconds
+    return slots
+
+def _format_duration(duration_seconds: int) -> str:
     """
-    minutes, secs = divmod(seconds, 60)
+    Render a duration in seconds as a spoken phrase, e.g.
+    "3 minutes", "1 hour, 30 minutes", "45 seconds".
+    """
+    minutes, seconds = divmod(duration_seconds, 60)
     hours, minutes = divmod(minutes, 60)
 
     parts: list[str] = []
@@ -373,84 +582,109 @@ def _duration_str(seconds: int) -> str:
         parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
     if minutes:
         parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
-    if secs:
-        parts.append(f"{secs} second{'s' if secs != 1 else ''}")
-    return ", ".join(parts)
+    if seconds:
+        parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+
+    return ", ".join(parts) if parts else "0 seconds"
+
+
+def _join_items(items: list[str]) -> str:
+    """
+    Join item names into a natural spoken list:
+    "milk" / "milk and eggs" / "milk, eggs, and bread"
+    """
+    capitalized = [item.capitalize() for item in items]
+    if len(capitalized) == 1:
+        return capitalized[0]
+    if len(capitalized) == 2:
+        return f"{capitalized[0]} and {capitalized[1]}"
+    return ", ".join(capitalized[:-1]) + f", and {capitalized[-1]}"
+
 
 async def handle_timer(slots: dict, satellite_ip: str) -> str | None:
-    raw_label = slots.get("label", "").strip()
-    duration = int(slots.get("duration_seconds", 0))
-
-    # No label and no duration — nothing useful to work with.
-    if not raw_label and duration <= 0:
-        return "Please restate command."
+    slots = _normalize_timer_duration(slots)
+    duration = int(slots.get("duration_seconds", 0) or 0)
 
     if duration <= 0:
-        return "Duration not recognised. Please restate command."
+        raise ClarificationNeeded(
+            intent="timer",
+            slots=slots,
+            missing_slot="duration_seconds",
+            question="Please specify duration.",
+        )
 
-    label = raw_label if raw_label else _GENERIC_TIMER_LABEL
+    duration_str = _format_duration(duration)
+
+    # No label given — no need to clarify. The duration itself doubles as
+    # the label, e.g. an unlabelled ten-minute timer is just "10 minutes".
+    label = slots.get("label", "")
+    label = label.strip() if isinstance(label, str) else ""
+    if not label:
+        label = duration_str
+
     fires_at = datetime.now(timezone.utc) + timedelta(seconds=duration)
- 
-    database.add_timer(
-        label=label,
-        fires_at=fires_at,
-        satellite_id=satellite_ip,
-        duration_label=_duration_str(duration),
-    )
+    database.add_timer(label=label, fires_at=fires_at, satellite_id=satellite_ip)
 
     log.info("Timer set: label=%r duration=%ds fires_at=%s satellite=%s",
              label, duration, fires_at.isoformat(), satellite_ip)
 
-    return f"Timer set. {_duration_str(duration)} remaining."
+    return f"Timer set. {duration_str} remaining."
 
 
 async def handle_list_add(slots: dict, satellite_ip: str) -> str | None:
     list_name = slots.get("list_name", "").strip()
-    # Accept either a list of items or a single string for robustness against
-    # models that don't always follow the schema exactly.
-    raw = slots.get("items", slots.get("item", ""))
-    if isinstance(raw, str):
-        items = [raw.strip()] if raw.strip() else []
-    else:
-        items = [str(i).strip() for i in raw if str(i).strip()]
+    raw_items = slots.get("list_items", [])
+    if isinstance(raw_items, str):
+        # Model returned a bare string instead of an array — treat it as a
+        # single item rather than failing the whole request.
+        raw_items = [raw_items]
+    elif not isinstance(raw_items, list):
+        raw_items = []
+    items = [str(item).strip() for item in raw_items if str(item).strip()]
 
     if not items:
-        return "Item not recognised. Please restate command."
+        raise ClarificationNeeded(
+            intent="list_add",
+            slots=slots,
+            missing_slot="list_items",
+            question="Please specify item.",
+        )
     if not list_name:
-        return "List name not recognised. Please restate command."
+        raise ClarificationNeeded(
+            intent="list_add",
+            slots=slots,
+            missing_slot="list_name",
+            question="Please specify list name.",
+        )
 
     for item in items:
         database.add_list_item(list_name=list_name, content=item)
 
-    log.info("List items added: list=%r items=%r", list_name, items)
-
-    # Build natural spoken confirmation.
-    if len(items) == 1:
-        added_str = items[0]
-    elif len(items) == 2:
-        added_str = f"{items[0]} and {items[1]}"
-    else:
-        added_str = ", ".join(i for i in items[:-1]) + f", and {items[-1]}"
-
-    return f"{added_str} added to {list_name} list."
+    log.info("List item(s) added: list=%r items=%r", list_name, items)
+    return f"{_join_items(items)} added to {list_name} list."
 
 
 async def handle_list_read(slots: dict, satellite_ip: str) -> str | None:
     list_name = slots.get("list_name", "").strip()
 
     if not list_name:
-        return "List name not recognised. Please restate command."
+        raise ClarificationNeeded(
+            intent="list_read",
+            slots=slots,
+            missing_slot="list_name",
+            question="Please specify list name.",
+        )
 
     items = database.get_list_items(list_name)
 
     log.info("List read: list=%r items=%d", list_name, len(items))
 
     if not items:
-        return f"{list_name} list contains no items."
+        return f"{list_name.capitalize()} list contains no items."
 
     # Spoken as: "Shopping list. Earl Grey. Milk. Bread."
-    item_str = ". ".join(item for item in items)
-    return f"{list_name} list. {item_str}."
+    item_str = ". ".join(item.capitalize() for item in items)
+    return f"{list_name.capitalize()} list. {item_str}."
 
 
 async def handle_converse(slots: dict, satellite_ip: str) -> str | None:
@@ -480,6 +714,10 @@ async def dispatch(intent: dict, satellite_ip: str) -> None:
 
     The ack is sent as a background task so it plays while the handler runs.
     The handler's return value (if not None) is handed off to TTS.
+
+    If the handler raises ClarificationNeeded, the question is spoken to the
+    user and the context is stored so the next utterance can fill the missing
+    slot without repeating intent extraction.
     """
     intent_name = intent.get("intent", "unknown")
     slots = intent.get("slots", {})
@@ -502,17 +740,41 @@ async def dispatch(intent: dict, satellite_ip: str) -> None:
 
     try:
         response_text = await handler(slots, satellite_ip)
+    except ClarificationNeeded as clarification:
+        # Handler needs more information. Store context, speak the question.
+        log.info(
+            "Clarification needed for intent=%r missing_slot=%r: %r",
+            clarification.intent, clarification.missing_slot, clarification.question,
+        )
+        ctx = conversation_state.ClarificationContext(
+            intent=clarification.intent,
+            slots=clarification.slots,
+            missing_slot=clarification.missing_slot,
+            question=clarification.question,
+        )
+        conversation_state.set(satellite_ip, ctx)
+
+        if ack_task is not None:
+            await ack_task
+        try:
+            # listen_after=True — satellite opens mic immediately after the
+            # question finishes playing, no wake word needed for the reply.
+            await send_to_tts(clarification.question, satellite_ip, listen_after=True)
+        except (ConnectionError, OSError):
+            log.exception("TTS unreachable when asking clarification question")
+            await send_canned("error", satellite_ip)
+        return
     except Exception:
         log.exception("Handler for %r raised an exception", intent_name)
         if ack_task is not None:
             await ack_task
         await send_canned("error", satellite_ip)
         return
- 
+
     # Ensure the ack has finished before TTS audio starts playing.
     if ack_task is not None:
         await ack_task
- 
+
     if response_text is not None:
         try:
             await send_to_tts(response_text, satellite_ip)
@@ -544,26 +806,16 @@ async def timer_poller() -> None:
 
         for row in due:
             timer_id = row["id"]
+            label = row["label"]
             satellite_ip = row["satellite_id"]
 
-            log.info("Timer fired: id=%d label=%r satellite=%s", timer_id, row["label"], satellite_ip)
+            log.info("Timer fired: id=%d label=%r satellite=%s", timer_id, label, satellite_ip)
 
             # Mark fired immediately — if TTS fails we still don't want to
             # re-announce on the next poll cycle.
             database.mark_timer_fired(timer_id)
 
-                        # Build announcement. Labelled timers use the label; unlabelled
-            # timers fall back to their stored duration ("3 minute timer
-            # complete."). duration_seconds is NULL for labelled timers.
-            label = row["label"]
-            duration_label = row["duration_label"]
-
-            if label != _GENERIC_TIMER_LABEL:
-                announcement = f"{label} timer complete."
-            elif duration_label:
-                announcement = f"{duration_label} timer complete."
-            else:
-                announcement = "Timer complete."
+            announcement = f"{label.capitalize()} timer complete."
             try:
                 await send_to_tts(announcement, satellite_ip)
             except (ConnectionError, OSError):
@@ -610,6 +862,9 @@ async def handle_connection(
 
     Expects a single Wyoming Transcript event. The satellite peer IP is in
     the event's data field (set by the STT server).
+
+    If a clarification context is pending for this satellite, the transcript
+    is routed to slot-filling rather than full intent extraction.
     """
     peer = writer.get_extra_info("peername")
     log.debug("Connection from STT server at %s", peer)
@@ -619,7 +874,7 @@ async def handle_connection(
         if event is None:
             log.warning("STT server closed connection before sending a Transcript")
             return
-        
+
         log.debug("Received event: type=%r data=%r payload=%r", event.type, event.data, event.payload)
 
         if not Transcript.is_type(event.type):
@@ -638,6 +893,51 @@ async def handle_connection(
             log.warning("Empty transcript from %s — nothing to do", satellite_name)
             return
 
+        # Check for a pending clarification context before running intent extraction.
+        ctx = conversation_state.get(satellite_ip)
+
+        if ctx is not None:
+            # We are mid-clarification. Try to fill the missing slot from this reply.
+            log.info(
+                "Clarification reply from %s (intent=%r missing_slot=%r turn=%d): %r",
+                satellite_name, ctx.intent, ctx.missing_slot, ctx.turn, text,
+            )
+            conversation_state.increment_turn(satellite_ip)
+
+            try:
+                fill_result = _call_ollama_slot_fill(text, ctx.missing_slot)
+                updated_slots = _merge_slot_from_fill(ctx.missing_slot, fill_result, ctx.slots)
+                log.debug("Slot fill succeeded: %s → %r", ctx.missing_slot, updated_slots.get(ctx.missing_slot))
+            except (urllib.error.URLError, TimeoutError) as exc:
+                log.error("Ollama unreachable during slot fill: %s", exc)
+                conversation_state.clear(satellite_ip)
+                await send_canned("error", satellite_ip)
+                return
+            except (json.JSONDecodeError, KeyError, ValueError) as exc:
+                # Model gave unusable output. If turns remain, re-ask; otherwise give up.
+                log.warning("Slot fill failed for %r: %s", ctx.missing_slot, exc)
+                remaining_ctx = conversation_state.get(satellite_ip)
+                if remaining_ctx is not None:
+                    # Turns not yet exhausted — re-ask the same question.
+                    try:
+                        await send_to_tts(ctx.question, satellite_ip, listen_after=True)
+                    except (ConnectionError, OSError):
+                        log.exception("TTS unreachable when re-asking clarification")
+                        conversation_state.clear(satellite_ip)
+                        await send_canned("error", satellite_ip)
+                else:
+                    # Max turns hit inside get() above — context already cleared.
+                    log.info("Max clarification turns reached for %s — resetting", satellite_name)
+                    await send_canned("unknown", satellite_ip)
+                return
+
+            # Slot filled successfully. Clear context and re-dispatch with completed slots.
+            conversation_state.clear(satellite_ip)
+            intent = {"intent": ctx.intent, "slots": updated_slots}
+            await dispatch(intent, satellite_ip)
+            return
+
+        # No pending clarification — normal intent extraction path.
         intent = extract_intent(text)
         await dispatch(intent, satellite_ip)
 

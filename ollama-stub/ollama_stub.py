@@ -40,11 +40,17 @@ MODELS = [
 # intent type plus a couple of edge cases worth exercising in the dispatcher.
 INTENT_CYCLE: list[dict] = [
     {"intent": "timer", "slots": {"label": "tea", "duration_seconds": 180}},
-    {"intent": "list_add", "slots": {"list_name": "shopping", "item": "earl grey"}},
-    {"intent": "list_add", "slots": {"list_name": "shopping", "item": "apples"}},
+    {"intent": "timer", "slots": {"label": "coffee", "hours": 0, "minutes": 1, "seconds": 30}},
+    {"intent": "timer", "slots": {"label": "bag"}},
+    {"hours": 0, "minutes": 3, "seconds": 30},
+    {"intent": "list_add", "slots": {"list_name": "shopping", "list_items": "earl grey"}},
+    {"intent": "list_add", "slots": {"list_items": ["apples"]}},
+    {"value": "shopping"},
+    {"intent": "list_add", "slots": {"list_name": "shopping", "list_items": ["cheese","milk","eggs"]}},
+    #{"intent": "list_add", "slots": {"list_name": "shopping", "item": "apples"}},
     {"intent": "list_read", "slots": {"list_name": "shopping"}},
     #{"intent": "converse", "slots": {}},
-    {"intent": "unknown", "slots": {}},
+    #{"intent": "unknown", "slots": {}},
     # Edge case: duration of zero should hit handle_timer's early-return path
     {"intent": "timer", "slots": {"label": "broken", "duration_seconds": 0}},
 ]

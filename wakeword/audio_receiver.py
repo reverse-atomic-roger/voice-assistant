@@ -15,9 +15,12 @@ change needed here, since this server only cares about the Wyoming audio
 events, not where the PCM originated.
 
 Wyoming event flow (inbound):
-    AudioStart  — declares sample rate / width / channels
-    AudioChunk  — raw PCM bytes (one or many)
-    AudioStop   — signals end of clip; playback finishes here
+    listen_after  — optional; if present before AudioStart, the satellite
+                    will open a capture window immediately after playback
+                    finishes, without requiring a new wake word activation.
+    AudioStart    — declares sample rate / width / channels
+    AudioChunk    — raw PCM bytes (one or many)
+    AudioStop     — signals end of clip; playback finishes here
 
 Dependencies:
     pip install wyoming
@@ -44,6 +47,9 @@ PORT = 10500
 log = logging.getLogger(__name__)
 
 
+LISTEN_AFTER_EVENT_TYPE = "listen_after"
+
+
 async def handle_connection(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -54,12 +60,18 @@ async def handle_connection(
     Accumulates PCM chunks declared by AudioStart, then plays the full
     clip via audio_io on AudioStop. audio_io.play_pcm() serialises against
     the wakeword earcons internally, so no locking is needed here.
+
+    If the orchestrator sends a listen_after event before AudioStart, the
+    audio_io.listen_after event is set after playback completes. wakeword_stream
+    watches for this and skips wake word detection for one capture cycle,
+    letting the user reply to a clarifying question without re-triggering.
     """
     peer = writer.get_extra_info("peername")
     log.info("Connection from %s", peer)
 
     audio_buffer = bytearray()
     rate = width = channels = None
+    prompted_listen = False  # set True if orchestrator sent listen_after
 
     try:
         while True:
@@ -68,7 +80,11 @@ async def handle_connection(
                 log.debug("Connection closed by %s", peer)
                 break
 
-            if AudioStart.is_type(event.type):
+            if event.type == LISTEN_AFTER_EVENT_TYPE:
+                prompted_listen = True
+                log.debug("listen_after received from %s — will open mic after playback", peer)
+
+            elif AudioStart.is_type(event.type):
                 start = AudioStart.from_event(event)
                 rate, width, channels = start.rate, start.width, start.channels
                 audio_buffer.clear()
@@ -87,6 +103,13 @@ async def handle_connection(
 
                 await audio_io.play_pcm(bytes(audio_buffer), rate, width, channels)
                 log.info("Played %d bytes of audio from %s", len(audio_buffer), peer)
+
+                # Signal wakeword_stream to capture a reply without a wake word.
+                # Set after play_pcm returns so the mic opens as soon as the
+                # speaker goes quiet — no gap for the user to wonder if it worked.
+                if prompted_listen:
+                    audio_io.listen_after.set()
+                    log.debug("listen_after event set — wakeword_stream will capture next utterance")
 
     except (ConnectionResetError, asyncio.IncompleteReadError):
         log.warning("Connection from %s dropped unexpectedly", peer)
