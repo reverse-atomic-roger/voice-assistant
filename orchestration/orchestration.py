@@ -31,8 +31,9 @@ Intent JSON schema (produced by small Ollama model):
     }
 
 Supported intents (Phase 1):
-    timer           slots: label (str), duration_seconds (int)
-    list_add        slots: list_name (str), item (str)
+    timer           slots: hours (int, optional), minutes (int, optional),
+                            seconds (int, optional), label (str, optional)
+    list_add        slots: list_name (str), list_items (list[str])
     list_read       slots: list_name (str)
     converse        slots: (none — escalate to large model, not yet implemented)
     unknown         slots: (none — fallback)
@@ -290,13 +291,26 @@ markdown fences — in this exact shape:
 Supported intents and their required slots:
 
   timer
-    label            (string)  short description of what the timer is for
-    duration_seconds (integer) total duration in seconds
+    hours    (integer, optional) hours component of the duration, if stated
+    minutes  (integer, optional) minutes component of the duration, if stated
+    seconds  (integer, optional) seconds component of the duration, if stated
+    label    (string, optional)  short description of what the timer is for,
+                                  only if the user actually gave one
+
+    Extract each time unit exactly as the user stated it. Do NOT perform any
+    arithmetic or unit conversion yourself — never convert "2 minutes" into
+    120 seconds, never add units together. Just report the raw number for
+    each unit mentioned; omit a unit (or use 0) if it was not mentioned.
+    If the user did not give the timer a name, omit the label field entirely
+    — do not invent one.
 
   list_add
-    list_name  (string) name of the list (e.g. "shopping", "todo")
-    item       (string) the item to add
-
+    list_name   (string)        name of the list (e.g. "shopping", "todo")
+    list_items  (array of string) every item the user wants added. The user
+                                   may mention one item or several in the
+                                   same request — always return a JSON array,
+                                   even for a single item.
+                                   e.g. ["milk"] or ["milk", "bread", "eggs"]
   list_read
     list_name  (string) name of the list to read out
 
@@ -310,6 +324,10 @@ Supported intents and their required slots:
 Rules:
 - Choose exactly one intent.
 - Only include slots defined for that intent.
+- For timer durations, return the numbers exactly as the user stated them —
+  never compute or convert a total yourself.
+- For list_add, always return list_items as a JSON array of strings, even
+  when only one item was mentioned.
 - Do not add commentary or explanation.
 """
 
@@ -399,10 +417,12 @@ _SLOT_FILL_DESCRIPTIONS: dict[str, str] = {
         "Return a JSON object with key: value (string). "
         "Example: 'the shopping list' → {\"value\": \"shopping\"}"
     ),
-    "item": (
-        "The item to add to the list. "
-        "Return a JSON object with key: value (string). "
-        "Example: 'a pint of milk' → {\"value\": \"a pint of milk\"}"
+    "list_items": (
+        "The item(s) the user wants added to the list. There may be one or "
+        "several mentioned in the same reply. "
+        "Return a JSON object with key: value, where value is a JSON array "
+        "of strings — even for a single item. "
+        'Example: "milk and a dozen eggs" → {\"value\": [\"milk\", \"a dozen eggs\"]}'
     ),
 }
 
@@ -462,10 +482,12 @@ def _merge_slot_from_fill(
 
     For duration_seconds, the LLM returns {hours, minutes, seconds} separately
     so we can do the arithmetic here rather than asking the model to multiply.
-    For all other slots, we expect {value: <string>}.
+    For list_items, the LLM returns {value: [<string>, ...]} since more than
+    one item may be supplied in a single clarifying reply.
 
     Returns the updated slots dict. Raises ValueError if the fill_result is
-    unusable (e.g. all zeros for a duration, or blank string for a name).
+    unusable (e.g. all zeros for a duration, or blank/empty for a name or
+    item list).
     """
     slots = dict(existing_slots)  # don't mutate the original
 
@@ -479,6 +501,22 @@ def _merge_slot_from_fill(
                 f"Duration slot fill returned zero or negative total: {fill_result!r}"
             )
         slots["duration_seconds"] = total
+
+    elif missing_slot == "list_items":
+        raw_items = fill_result.get("value", [])
+        if isinstance(raw_items, str):
+            # Model gave a bare string instead of a list — treat it as a
+            # single item rather than discarding a perfectly good reply.
+            raw_items = [raw_items]
+        elif not isinstance(raw_items, list):
+            raw_items = []
+        items = [str(item).strip() for item in raw_items if str(item).strip()]
+        if not items:
+            raise ValueError(
+                f"Slot fill for list_items returned no usable items: {fill_result!r}"
+            )
+        slots["list_items"] = items
+
     else:
         value = str(fill_result.get("value", "")).strip()
         if not value:
@@ -499,23 +537,44 @@ def _merge_slot_from_fill(
 # Raise freely; the dispatcher catches and sends the canned error response.
 # ---------------------------------------------------------------------------
 
-async def handle_timer(slots: dict, satellite_ip: str) -> str | None:
-    label = slots.get("label", "timer")
-    duration = int(slots.get("duration_seconds", 0))
+def _normalize_timer_duration(slots: dict) -> dict:
+    """
+    Deterministically convert raw hours/minutes/seconds slots (as supplied
+    by the LLM) into a single duration_seconds total.
 
-    if duration <= 0:
-        raise ClarificationNeeded(
-            intent="timer",
-            slots=slots,
-            missing_slot="duration_seconds",
-            question="Please specify duration.",
-        )
+    The LLM is explicitly instructed never to do this arithmetic itself —
+    it only ever reports the units the user mentioned. All unit conversion
+    happens here, in plain Python, so a model arithmetic slip can never
+    produce a wrong timer length.
 
-    fires_at = datetime.now(timezone.utc) + timedelta(seconds=duration)
-    database.add_timer(label=label, fires_at=fires_at, satellite_id=satellite_ip)
+    If none of hours/minutes/seconds are present in `slots` — e.g. these
+    slots already carry a duration_seconds total computed earlier via a
+    completed clarification turn — the slots are returned unchanged.
+    """
+    if not any(key in slots for key in ("hours", "minutes", "seconds")):
+        return slots
 
-    # Build the spoken duration — "3 minutes", "1 minute 30 seconds", etc.
-    minutes, seconds = divmod(duration, 60)
+    slots = dict(slots)  # don't mutate the caller's dict
+
+    def _as_int(value) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    hours = _as_int(slots.pop("hours", 0))
+    minutes = _as_int(slots.pop("minutes", 0))
+    seconds = _as_int(slots.pop("seconds", 0))
+
+    slots["duration_seconds"] = hours * 3600 + minutes * 60 + seconds
+    return slots
+
+def _format_duration(duration_seconds: int) -> str:
+    """
+    Render a duration in seconds as a spoken phrase, e.g.
+    "3 minutes", "1 hour, 30 minutes", "45 seconds".
+    """
+    minutes, seconds = divmod(duration_seconds, 60)
     hours, minutes = divmod(minutes, 60)
 
     parts: list[str] = []
@@ -526,7 +585,45 @@ async def handle_timer(slots: dict, satellite_ip: str) -> str | None:
     if seconds:
         parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
 
-    duration_str = ", ".join(parts)
+    return ", ".join(parts) if parts else "0 seconds"
+
+
+def _join_items(items: list[str]) -> str:
+    """
+    Join item names into a natural spoken list:
+    "milk" / "milk and eggs" / "milk, eggs, and bread"
+    """
+    capitalized = [item.capitalize() for item in items]
+    if len(capitalized) == 1:
+        return capitalized[0]
+    if len(capitalized) == 2:
+        return f"{capitalized[0]} and {capitalized[1]}"
+    return ", ".join(capitalized[:-1]) + f", and {capitalized[-1]}"
+
+
+async def handle_timer(slots: dict, satellite_ip: str) -> str | None:
+    slots = _normalize_timer_duration(slots)
+    duration = int(slots.get("duration_seconds", 0) or 0)
+
+    if duration <= 0:
+        raise ClarificationNeeded(
+            intent="timer",
+            slots=slots,
+            missing_slot="duration_seconds",
+            question="Please specify duration.",
+        )
+
+    duration_str = _format_duration(duration)
+
+    # No label given — no need to clarify. The duration itself doubles as
+    # the label, e.g. an unlabelled ten-minute timer is just "10 minutes".
+    label = slots.get("label", "")
+    label = label.strip() if isinstance(label, str) else ""
+    if not label:
+        label = duration_str
+
+    fires_at = datetime.now(timezone.utc) + timedelta(seconds=duration)
+    database.add_timer(label=label, fires_at=fires_at, satellite_id=satellite_ip)
 
     log.info("Timer set: label=%r duration=%ds fires_at=%s satellite=%s",
              label, duration, fires_at.isoformat(), satellite_ip)
@@ -536,13 +633,20 @@ async def handle_timer(slots: dict, satellite_ip: str) -> str | None:
 
 async def handle_list_add(slots: dict, satellite_ip: str) -> str | None:
     list_name = slots.get("list_name", "").strip()
-    item = slots.get("item", "").strip()
+    raw_items = slots.get("list_items", [])
+    if isinstance(raw_items, str):
+        # Model returned a bare string instead of an array — treat it as a
+        # single item rather than failing the whole request.
+        raw_items = [raw_items]
+    elif not isinstance(raw_items, list):
+        raw_items = []
+    items = [str(item).strip() for item in raw_items if str(item).strip()]
 
-    if not item:
+    if not items:
         raise ClarificationNeeded(
             intent="list_add",
             slots=slots,
-            missing_slot="item",
+            missing_slot="list_items",
             question="Please specify item.",
         )
     if not list_name:
@@ -553,10 +657,11 @@ async def handle_list_add(slots: dict, satellite_ip: str) -> str | None:
             question="Please specify list name.",
         )
 
-    database.add_list_item(list_name=list_name, content=item)
+    for item in items:
+        database.add_list_item(list_name=list_name, content=item)
 
-    log.info("List item added: list=%r item=%r", list_name, item)
-    return f"{item.capitalize()} added to {list_name} list."
+    log.info("List item(s) added: list=%r items=%r", list_name, items)
+    return f"{_join_items(items)} added to {list_name} list."
 
 
 async def handle_list_read(slots: dict, satellite_ip: str) -> str | None:
