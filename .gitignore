@@ -49,3 +49,5 @@ ollama-stub/.vscode
 ollama-stub/__pycache__
 ollama-stub/*.pyc
 ollama-stub/*.pyo
+launch-all.ps1
+launch-all.sh
