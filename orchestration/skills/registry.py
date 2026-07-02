@@ -33,6 +33,8 @@ REGISTERED_SKILLS: list[Skill] = [
     timer.SKILL,
     lists.SKILL_LIST_ADD,
     lists.SKILL_LIST_READ,
+    lists.SKILL_LIST_CLEAR,
+    lists.SKILL_LIST_MERGE,
     converse.SKILL,
     unknown.SKILL,
 ]

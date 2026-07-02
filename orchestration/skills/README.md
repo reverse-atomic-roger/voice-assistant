@@ -92,6 +92,48 @@ rather than misbehaving mid-conversation.
   keys everything by `(intent, slot)`, so two skills can both have a
   `name` slot without colliding.
 
+## Owning your own persistence
+
+If your skill needs to remember something between requests, it gets its
+own table — you don't add a function to `database.py` for it, and
+`database.py` never needs to change. Two calls:
+
+```python
+import database
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS play_music_favorites (
+    id      INTEGER PRIMARY KEY,
+    song    TEXT NOT NULL
+);
+"""
+database.register_schema(_SCHEMA)   # once, at module level
+
+def _add_favorite(song: str) -> None:
+    conn = database.get_connection()
+    conn.execute("INSERT INTO play_music_favorites (song) VALUES (?)", (song,))
+    conn.commit()
+```
+
+`register_schema()` queues your DDL to be applied alongside every other
+skill's when the orchestrator calls `database.init()` at startup.
+`get_connection()` hands back the same shared SQLite connection every
+built-in skill already uses — write whatever queries your table needs,
+same as `skills/lists.py` does for its `lists`/`list_items` tables.
+
+A couple of things to keep in mind:
+
+- Use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` — your
+  schema runs every time the orchestrator starts.
+- `register_schema()` has to run at import time (module level, like the
+  example above), not from inside a handler — it raises if called after
+  `database.init()` has already run.
+- This is for storage nothing else touches. If two skills need to share
+  state, or the orchestrator itself needs to query it directly outside of
+  any handler (timers are the one built-in example — the timer poller in
+  `orchestration.py` reads them directly), that's a real function in
+  `database.py`, not a skill-owned table.
+
 ## One thing to know before sharing a skill
 
 A skill runs with the same access as the rest of the orchestrator — your
