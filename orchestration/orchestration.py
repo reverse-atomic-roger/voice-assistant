@@ -46,7 +46,7 @@ import logging
 import sys
 import urllib.request
 import urllib.error
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Callable
 
 from wyoming.asr import Transcript
@@ -58,7 +58,7 @@ import conversation_state
 import database
 from conversation_state import ClarificationNeeded
 from skills.base import SlotSpec, parse_value_string
-from skills.registry import REGISTERED_SKILLS
+from skills.registry import REGISTERED_SKILLS, TRIGGER_HANDLERS
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -86,9 +86,11 @@ INTENT_MODEL = "qwen2.5:3b"
 TTS_HOST = "127.0.0.1"
 TTS_PORT = 10302
 
-# CONFIGURE: how often the timer poller wakes to check for due timers (seconds).
-# 5 seconds gives acceptable precision without hammering the DB.
-TIMER_POLL_INTERVAL = 5
+# CONFIGURE: how often the trigger poller wakes to check for due triggers
+# (seconds). 5 seconds gives acceptable precision without hammering the DB.
+# Shared by every skill that schedules future events (timers today; alarms,
+# scheduled lights, etc. later) — there's one poller, not one per skill.
+TRIGGER_POLL_INTERVAL = 5
 
 # Clarification timeout and max turns are configured in conversation_state.py.
 # Pre-synthesised response config (RESPONSES_DIR, RESPONSE_FILES) lives in
@@ -443,52 +445,83 @@ async def dispatch(intent: dict, satellite_ip: str) -> None:
             await audio_io.send_canned("error", satellite_ip)
 
 # ---------------------------------------------------------------------------
-# Timer polling loop
+# Trigger polling loop
 # ---------------------------------------------------------------------------
+# Generic across every skill that schedules a future event — this function
+# has no idea what a "timer" is. It knows how to find due rows, how to ask
+# the right skill what to say about one, and how to get that text to a
+# satellite. What the event means is entirely up to the skill that scheduled
+# it; see skills/base.py's TriggerHandler and skills/timer.py for the one
+# built-in example.
 
-async def timer_poller() -> None:
+async def trigger_poller() -> None:
     """
-    Background task. Wakes every TIMER_POLL_INTERVAL seconds, checks for
-    due timers in the database, fires a TTS announcement to the originating
-    satellite for each one, then marks them as fired.
+    Background task. Wakes every TRIGGER_POLL_INTERVAL seconds, checks for
+    due triggers in the database, asks the owning skill's TriggerHandler
+    for announcement text, and sends it to the trigger's satellite_ip.
 
-    Runs for the lifetime of the process. Errors on individual timer
-    announcements are logged and skipped — a failed TTS call does not
-    stop the poller or affect other timers.
+    Runs for the lifetime of the process. Errors on any individual trigger
+    (missing handler, handler exception, TTS failure) are logged and
+    skipped — they never stop the poller or affect other due triggers.
     """
-    log.info("Timer poller started (interval=%ds)", TIMER_POLL_INTERVAL)
+    log.info("Trigger poller started (interval=%ds)", TRIGGER_POLL_INTERVAL)
 
     while True:
-        await asyncio.sleep(TIMER_POLL_INTERVAL)
+        await asyncio.sleep(TRIGGER_POLL_INTERVAL)
 
         now = datetime.now(timezone.utc)
-        due = database.get_due_timers(now)
+        due = database.get_due_triggers(now)
 
-        for row in due:
-            timer_id = row["id"]
-            label = row["label"]
-            satellite_ip = row["satellite_id"]
+        for trigger in due:
+            log.info(
+                "Trigger fired: id=%d skill=%r trigger_key=%r satellite=%s",
+                trigger.id, trigger.skill, trigger.trigger_key, trigger.satellite_ip,
+            )
 
-            log.info("Timer fired: id=%d label=%r satellite=%s", timer_id, label, satellite_ip)
+            # Mark fired immediately — if the handler or TTS fails below, we
+            # still don't want to re-announce it on the next poll cycle.
+            database.mark_trigger_fired(trigger.id)
 
-            # Mark fired immediately — if TTS fails we still don't want to
-            # re-announce on the next poll cycle.
-            database.mark_timer_fired(timer_id)
+            handler = TRIGGER_HANDLERS.get(trigger.skill)
+            if handler is None:
+                # A trigger row exists for a skill name with no registered
+                # TriggerHandler — most likely a skill was removed from
+                # SKILL_MODULES (or renamed its skill_name) while old rows
+                # for it were still pending. Nothing sensible to announce.
+                log.error(
+                    "No TriggerHandler registered for skill=%r (trigger id=%d) — "
+                    "dropping. Was this skill removed from skills/registry.py's "
+                    "SKILL_MODULES, or its TRIGGER.skill_name renamed?",
+                    trigger.skill, trigger.id,
+                )
+                continue
 
-            announcement = f"{label.capitalize()} timer complete."
             try:
-                await send_to_tts(announcement, satellite_ip)
+                announcement = await handler.on_trigger(trigger.payload)
+            except Exception:
+                log.exception(
+                    "TriggerHandler for skill=%r raised on trigger id=%d — announcement lost",
+                    trigger.skill, trigger.id,
+                )
+                continue
+
+            if announcement is None:
+                # Skill handled its own output (or has nothing to say).
+                continue
+
+            try:
+                await send_to_tts(announcement, trigger.satellite_ip)
             except (ConnectionError, OSError):
                 log.exception(
-                    "TTS unreachable when announcing timer id=%d label=%r to %s",
-                    timer_id, label, satellite_ip,
+                    "TTS unreachable when announcing trigger id=%d (skill=%r) to %s",
+                    trigger.id, trigger.skill, trigger.satellite_ip,
                 )
                 try:
-                    await audio_io.send_canned("error", satellite_ip)
+                    await audio_io.send_canned("error", trigger.satellite_ip)
                 except (ConnectionError, OSError):
                     log.exception(
-                        "Could not reach satellite %s for timer id=%d — announcement lost",
-                        satellite_ip, timer_id,
+                        "Could not reach satellite %s for trigger id=%d — announcement lost",
+                        trigger.satellite_ip, trigger.id,
                     )
 
 
@@ -651,8 +684,8 @@ async def run() -> None:
     addrs = [str(sock.getsockname()) for sock in server.sockets]
     log.info("Orchestrator listening on %s", addrs)
 
-    # Start the timer poller as a long-lived background task.
-    poller_task = asyncio.create_task(timer_poller(), name="timer-poller")
+    # Start the trigger poller as a long-lived background task.
+    poller_task = asyncio.create_task(trigger_poller(), name="trigger-poller")
 
     try:
         async with server:

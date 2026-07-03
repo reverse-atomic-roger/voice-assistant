@@ -134,6 +134,59 @@ A couple of things to keep in mind:
   `orchestration.py` reads them directly), that's a real function in
   `database.py`, not a skill-owned table.
 
+## Scheduling future events (triggers)
+
+If your skill needs to do something later — a countdown, a scheduled
+announcement, anything with a "fires at time T" shape — you don't add
+polling logic to orchestration.py. There's already one generic poller
+shared by every skill; you just hook into it.
+
+Two calls:
+
+```python
+import database
+from skills.base import Skill, TriggerHandler
+
+async def handle(slots: dict, satellite_ip: str) -> str | None:
+    # ... figure out when this should fire and what to remember ...
+    database.add_trigger(
+        skill="play_music",              # matches TRIGGER.skill_name below
+        trigger_key=song,                # skill-local, not interpreted by the core
+        fires_at=fires_at,               # UTC-aware datetime
+        satellite_ip=satellite_ip,       # where the announcement gets delivered
+        payload={"song": song},          # whatever your on_trigger callback needs
+    )
+    return "Got it, I'll let you know."
+
+async def _on_fire(payload: dict) -> str | None:
+    return f"{payload['song']} finished."
+
+TRIGGER = TriggerHandler(skill_name="play_music", on_trigger=_on_fire)
+```
+
+Then add your module to `SKILL_MODULES` in `skills/registry.py` (alongside
+adding your `Skill` objects to `REGISTERED_SKILLS` as usual). That's the
+whole job — the registry picks up your `TRIGGER` automatically from there.
+
+A few things worth knowing about how this works:
+
+- **`payload` is entirely yours.** The core stores and returns it as opaque
+  JSON — it never reads or validates its contents. Put whatever your
+  `on_trigger` callback needs to compose its announcement.
+- **`satellite_ip` is not part of payload.** Routing the eventual
+  announcement to a satellite is core delivery infrastructure, so it's a
+  real argument to `add_trigger`, not something you have to smuggle through
+  your own payload.
+- **`on_trigger` returns text or `None`.** Return the string to speak, or
+  `None` if your skill already handled its own audio output and there's
+  nothing more to say.
+- **One `TRIGGER` per module.** If a module exposes several `Skill` objects
+  (like `lists.py` does) but only some of them schedule future events, it
+  still only needs one `TRIGGER` — `skill=` at scheduling time is what ties
+  a specific trigger row back to it, not the intent that created it.
+- **`skill_name` must be unique**, checked the same way `intent` is —
+  `skills/registry.py` fails loudly at import time on a collision.
+
 ## One thing to know before sharing a skill
 
 A skill runs with the same access as the rest of the orchestrator — your
