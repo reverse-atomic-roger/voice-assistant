@@ -10,6 +10,11 @@ the only orchestrator-side thing a new skill needs to import:
     from skills.base import Skill, SlotSpec, ClarificationNeeded
     from skills.base import parse_value_string, parse_value_string_list
 
+A skill that needs to do something at a future time (a countdown, a
+scheduled announcement, anything with a "fires later" shape) additionally
+exposes a module-level `TRIGGER = TriggerHandler(...)` — see that class's
+docstring below and skills/timer.py for a worked example.
+
 Skills also commonly import `database` directly for persistence, and only
 rarely need `audio_io.send_canned` — only if a skill wants to suppress the
 normal TTS response and play a pre-synthesised sound instead (see
@@ -78,6 +83,37 @@ class Skill:
     prompt_block: str
     handler: Callable[[dict, str], Awaitable[str | None]]
     slot_specs: dict[str, SlotSpec] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TriggerHandler:
+    """
+    Registers a skill's callback for its own future-firing events.
+
+    A skill schedules a future event with `database.add_trigger(skill=...,
+    trigger_key=..., fires_at=..., satellite_ip=..., payload={...})` from
+    inside its normal `handle()` — e.g. timer.py does this when a countdown
+    is set. Later, when the orchestrator's generic trigger poller finds that
+    row due, it looks up the TriggerHandler whose skill_name matches the
+    row's `skill` column and awaits `on_trigger(payload)`.
+
+    skill_name: must match the `skill=` value passed to
+                `database.add_trigger(...)` when the event was scheduled.
+                Checked for uniqueness across all registered skills by
+                skills/registry.py, the same way `Skill.intent` is.
+    on_trigger: async def (payload: dict) -> str | None. `payload` is
+                exactly the dict the skill originally stored — the core
+                never inspects or modifies it, so put whatever the skill
+                needs to compose its announcement in there (e.g. a label).
+                Return the text to speak, or None if the skill doesn't want
+                anything said (e.g. it already did its own audio I/O).
+                The poller already knows *where* to send that text — it
+                comes from the trigger's `satellite_ip`, set once at
+                scheduling time — so on_trigger only needs to decide *what*
+                to say.
+    """
+    skill_name: str
+    on_trigger: Callable[[dict], Awaitable[str | None]]
 
 
 # ---------------------------------------------------------------------------

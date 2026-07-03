@@ -2,13 +2,28 @@
 skills/timer.py
 
 Built-in "timer" skill: set a countdown timer, optionally labelled.
+
+Owns everything timer-shaped end to end, including what happens when the
+countdown finishes: it schedules a generic core trigger via
+`database.add_trigger(skill="timer", ...)` and registers `TRIGGER` below so
+the orchestrator's trigger poller knows to call back into this module when
+that row comes due. The core (orchestration.py, database.py) has no idea
+what a "timer" is — see skills/base.py's TriggerHandler docstring for the
+mechanism this relies on.
 """
 
 import logging
 from datetime import datetime, timedelta, timezone
 
 import database
-from skills.base import ClarificationNeeded, Skill, SlotSpec, parse_duration, parse_value_string
+from skills.base import (
+    ClarificationNeeded,
+    Skill,
+    SlotSpec,
+    TriggerHandler,
+    parse_duration,
+    parse_value_string,
+)
 
 log = logging.getLogger(__name__)
 
@@ -98,12 +113,37 @@ async def handle(slots: dict, satellite_ip: str) -> str | None:
         label = duration_str
 
     fires_at = datetime.now(timezone.utc) + timedelta(seconds=duration)
-    database.add_timer(label=label, fires_at=fires_at, satellite_id=satellite_ip)
+
+    # trigger_key doesn't need to be globally unique — it's only ever looked
+    # up by this skill, scoped to skill="timer" — but the label makes for a
+    # readable one and gives a future "cancel timer" handler something to
+    # search on.
+    database.add_trigger(
+        skill="timer",
+        trigger_key=label,
+        fires_at=fires_at,
+        satellite_ip=satellite_ip,
+        payload={"label": label},
+    )
 
     log.info("Timer set: label=%r duration=%ds fires_at=%s satellite=%s",
              label, duration, fires_at.isoformat(), satellite_ip)
 
     return f"Timer set. {duration_str} remaining."
+
+
+async def _on_timer_trigger(payload: dict) -> str:
+    """
+    Called by the orchestrator's trigger poller when a timer's trigger row
+    comes due. `payload` is exactly what handle() stored above — the core
+    never looks inside it, so this is the only place that needs to know a
+    timer's payload shape is `{"label": str}`.
+    """
+    label = payload.get("label") or "Timer"
+    return f"{label.capitalize()} timer complete."
+
+
+TRIGGER = TriggerHandler(skill_name="timer", on_trigger=_on_timer_trigger)
 
 
 SKILL = Skill(
