@@ -13,6 +13,12 @@ here, registered via `database.register_schema()` and run through
 `database.get_connection()`. Nothing outside this file touches list data,
 so there's no reason for database.py to know these tables exist — see
 skills/README.md, "Owning your own persistence".
+
+Handlers below take `target_satellites` (per the standard Skill handler
+signature) but don't do anything with it — delivery of the returned text to
+every named target is handled centrally by orchestration.dispatch(). A list
+skill would only need to inspect it directly if it wanted to do something
+target-aware beyond "speak this text there too", which none of these do.
 """
 
 import logging
@@ -191,7 +197,7 @@ def _join_items(items: list[str]) -> str:
     return ", ".join(capitalized[:-1]) + f", and {capitalized[-1]}"
 
 
-async def handle_add(slots: dict, satellite_ip: str) -> str | None:
+async def handle_add(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
     list_name = slots.get("list_name", "").strip()
     raw_items = slots.get("list_items", [])
     if isinstance(raw_items, str):
@@ -224,7 +230,7 @@ async def handle_add(slots: dict, satellite_ip: str) -> str | None:
     return f"{_join_items(items)} added to {list_name} list."
 
 
-async def handle_read(slots: dict, satellite_ip: str) -> str | None:
+async def handle_read(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
     list_name = slots.get("list_name", "").strip()
 
     if not list_name:
@@ -247,7 +253,7 @@ async def handle_read(slots: dict, satellite_ip: str) -> str | None:
     return f"{list_name.capitalize()} list. {item_str}."
 
 
-async def handle_clear(slots: dict, satellite_ip: str) -> str | None:
+async def handle_clear(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
     list_name = slots.get("list_name", "").strip()
 
     if not list_name:
@@ -267,7 +273,7 @@ async def handle_clear(slots: dict, satellite_ip: str) -> str | None:
     return f"{list_name.capitalize()} list cleared."
 
 
-async def handle_merge(slots: dict, satellite_ip: str) -> str | None:
+async def handle_merge(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
     source_list = slots.get("source_list", "").strip()
     destination_list = slots.get("destination_list", "").strip()
 

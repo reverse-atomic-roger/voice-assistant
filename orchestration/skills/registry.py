@@ -33,7 +33,7 @@ skills never need to think about this at all.
 
 import logging
 
-from skills import converse, lists, timer, unknown
+from skills import lists, timer, unknown
 from skills.base import Skill, TriggerHandler
 
 # To enable a shared/community skill:
@@ -49,7 +49,6 @@ REGISTERED_SKILLS: list[Skill] = [
     lists.SKILL_LIST_READ,
     lists.SKILL_LIST_CLEAR,
     lists.SKILL_LIST_MERGE,
-    converse.SKILL,
     unknown.SKILL,
 ]
 
@@ -57,7 +56,7 @@ REGISTERED_SKILLS: list[Skill] = [
 # module-level TRIGGER. Listed separately from REGISTERED_SKILLS because a
 # module can expose several Skill objects (see lists.py) but at most one
 # TRIGGER — modules, not intents, are what own a trigger handler.
-SKILL_MODULES = [timer, lists, converse, unknown]
+SKILL_MODULES = [timer, lists, unknown]
 
 
 def _validate(skills: list[Skill]) -> None:

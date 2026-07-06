@@ -17,7 +17,7 @@ PROMPT_BLOCK = """\
     song_title  (string) the song the user wants to play
 """
 
-async def handle(slots: dict, satellite_ip: str) -> str | None:
+async def handle(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
     song = slots.get("song_title", "").strip()
     if not song:
         raise ClarificationNeeded(
@@ -54,11 +54,21 @@ That's the whole interface. Three pieces:
   intent-specific instruction paragraph). Fold any formatting rules
   specific to your intent into this block — don't assume anything outside
   your skill's own file.
-- **`handler`** — `async def (slots: dict, satellite_ip: str) -> str | None`.
+- **`handler`** — `async def (slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None`.
   Return a string to be spoken back to the user, or `None` if you already
   handled the audio yourself. Raise `ClarificationNeeded` for any required
   slot that's missing — the orchestrator will ask the question for you and
   bring the answer back through `slot_specs`.
+  `satellite_ip` is the satellite that heard the command (the origin) —
+  use it for anything that should always go back to the speaker regardless
+  of routing. `target_satellites` is where the orchestrator will actually
+  deliver your returned text, already resolved from whatever the user
+  said (e.g. "in the kitchen"), defaulting to `[satellite_ip]` if they
+  named nowhere. Most skills can just return text and ignore
+  `target_satellites` entirely — the orchestrator handles delivery to
+  every target for you. Only reach for it directly if your skill needs
+  the destination for something else, like passing it through to
+  `database.add_trigger(...)` the way `skills/timer.py` does.
 - **`slot_specs`** — only needed for slots you might ask the user to
   clarify. For a plain string slot, `parse_value_string` covers it; for
   "one or more items", `parse_value_string_list` covers it. Write your own
@@ -87,7 +97,15 @@ rather than misbehaving mid-conversation.
 
 - `database` — for persistence, same as the built-in skills use.
 - Clarification handling — your handler doesn't need to know or care
-  whether a slot came from the first request or a follow-up reply.
+  whether a slot came from the first request or a follow-up reply, and a
+  room named before a clarifying question ("set a timer in the kitchen for
+  ... uh...") is preserved through the follow-up automatically.
+- Multi-room routing — "in the kitchen", "in the bedroom and the kitchen",
+  or nothing at all (defaults to wherever the command was heard) is parsed
+  and resolved to satellite IPs before your handler ever runs. Just return
+  text; the orchestrator delivers it everywhere it needs to go. See
+  `target_satellites` in "The contract" above if your skill needs to know
+  the destination itself.
 - Slot names only need to be unique *within your skill* — the registry
   keys everything by `(intent, slot)`, so two skills can both have a
   `name` slot without colliding.
@@ -147,13 +165,14 @@ Two calls:
 import database
 from skills.base import Skill, TriggerHandler
 
-async def handle(slots: dict, satellite_ip: str) -> str | None:
+async def handle(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
     # ... figure out when this should fire and what to remember ...
     database.add_trigger(
         skill="play_music",              # matches TRIGGER.skill_name below
         trigger_key=song,                # skill-local, not interpreted by the core
         fires_at=fires_at,               # UTC-aware datetime
-        satellite_ip=satellite_ip,       # where the announcement gets delivered
+        origin_satellite_ip=satellite_ip,      # who asked, for error reporting
+        target_satellites=target_satellites,   # where the announcement plays
         payload={"song": song},          # whatever your on_trigger callback needs
     )
     return "Got it, I'll let you know."
@@ -173,10 +192,15 @@ A few things worth knowing about how this works:
 - **`payload` is entirely yours.** The core stores and returns it as opaque
   JSON — it never reads or validates its contents. Put whatever your
   `on_trigger` callback needs to compose its announcement.
-- **`satellite_ip` is not part of payload.** Routing the eventual
-  announcement to a satellite is core delivery infrastructure, so it's a
-  real argument to `add_trigger`, not something you have to smuggle through
-  your own payload.
+- **Routing is decided once, at scheduling time, not part of payload.**
+  `origin_satellite_ip` and `target_satellites` are real arguments to
+  `add_trigger`, not something you smuggle through your own payload —
+  routing audio is core delivery infrastructure. Just pass through the
+  `satellite_ip` and `target_satellites` your `handle()` was called with;
+  by the time the trigger fires, the core already knows who to tell if
+  delivery fails (`origin_satellite_ip`) and where to actually play the
+  announcement (`target_satellites`), without `on_trigger` needing to
+  decide either one again.
 - **`on_trigger` returns text or `None`.** Return the string to speak, or
   `None` if your skill already handled its own audio output and there's
   nothing more to say.

@@ -27,8 +27,15 @@ Wyoming event flow (outbound to satellite):
 Intent JSON schema (produced by small Ollama model):
     {
         "intent": "<intent_name>",
-        "slots": { ... }          # intent-specific key/value pairs
+        "slots": { ... },          # intent-specific key/value pairs
+        "target_satellites": [ ]   # room names the response should play in;
+                                   # empty/omitted means "wherever this was heard"
     }
+
+target_satellites is extracted once, at the top level, for every intent —
+it is routing metadata, not part of any skill's own slots. See
+_resolve_target_satellites() for how room names become satellite IPs and
+skills/base.py's Skill docstring for how it reaches skill handlers.
 
 Supported intents are not hard-coded here — they're whatever's registered in
 skills/registry.py. Each entry in that list documents its own intent name and
@@ -180,8 +187,15 @@ markdown fences — in this exact shape:
 
 {
   "intent": "<intent_name>",
-  "slots": {}
+  "slots": {},
+  "target_satellites": []
 }
+
+target_satellites is a JSON array of room names naming where the response
+should be played, e.g. "set a timer in the kitchen" -> ["kitchen"]. Only
+include a room if the user actually named one — if no room is mentioned,
+return an empty array; the response automatically goes back to whichever
+room heard the command. A user may name more than one room.
 
 Supported intents and their required slots:
 """
@@ -190,13 +204,17 @@ _INTENT_PROMPT_FOOTER = """
 Rules:
 - Choose exactly one intent.
 - Only include slots defined for that intent.
+- Only include a target_satellites entry if it exactly matches one of the
+  valid room names above; omit anything you don't recognise rather than
+  guessing.
 - Do not add commentary or explanation.
 """
 
 
 def _build_intent_system_prompt(skills: list) -> str:
     blocks = "\n".join(skill.prompt_block for skill in skills)
-    return _INTENT_PROMPT_HEADER + "\n" + blocks + _INTENT_PROMPT_FOOTER
+    satellite_line = f"Valid room names: {', '.join(sorted(SATELLITES))}.\n"
+    return _INTENT_PROMPT_HEADER + "\n" + satellite_line + "\n" + blocks + _INTENT_PROMPT_FOOTER
 
 
 INTENT_SYSTEM_PROMPT = _build_intent_system_prompt(REGISTERED_SKILLS)
@@ -253,7 +271,7 @@ def extract_intent(transcript: str) -> dict:
     except KeyError as exc:
         log.error("Unexpected Ollama response shape, missing key: %s", exc)
 
-    return {"intent": "unknown", "slots": {}}
+    return {"intent": "unknown", "slots": {}, "target_satellites": []}
 
 
 # ---------------------------------------------------------------------------
@@ -370,28 +388,44 @@ def _merge_slot_from_fill(
 HANDLERS: dict[str, Callable] = {skill.intent: skill.handler for skill in REGISTERED_SKILLS}
 
 
-async def dispatch(intent: dict, satellite_ip: str) -> None:
+async def dispatch(intent: dict, satellite_ip: str, target_satellites: list[str]) -> None:
     """
     Fire the acknowledgement earcon, then route to the correct skill handler.
 
     The ack is sent as a background task so it plays while the handler runs.
-    The handler's return value (if not None) is handed off to TTS.
+    The handler's return value (if not None) is broadcast via TTS to every
+    IP in target_satellites.
+
+    satellite_ip is always the satellite that heard the command (the
+    origin) — the ack, clarification questions, and error responses always
+    go there regardless of target_satellites, so the person who's talking
+    always gets feedback even if their actual request was routed elsewhere.
+
+    target_satellites must already be resolved to satellite IPs (see
+    _resolve_target_satellites) before calling this — dispatch() itself
+    does no name lookup, so a clarification follow-up can pass the same
+    list it captured on the first turn without re-resolving anything.
 
     If the handler raises ClarificationNeeded, the question is spoken to the
-    user and the context is stored so the next utterance can fill the missing
-    slot without repeating intent extraction.
+    user and the context (including target_satellites) is stored so the next
+    utterance can fill the missing slot without repeating intent extraction
+    or losing the originally-named room.
     """
     intent_name = intent.get("intent", "unknown")
     slots = intent.get("slots", {})
     handler = HANDLERS.get(intent_name, HANDLERS["unknown"])
 
     satellite_name = satellite_name_from_ip(satellite_ip) or satellite_ip
-    log.info("Dispatching intent=%r slots=%s from %s", intent_name, slots, satellite_name)
+    log.info(
+        "Dispatching intent=%r slots=%s from %s -> targets=%s",
+        intent_name, slots, satellite_name, target_satellites,
+    )
 
     # Fire acknowledgement immediately for known intents — runs concurrently
     # with the handler so the satellite has audio feedback while we wait on
     # the TTS. Unknown intent gets no ack; it will play its own canned
-    # response instead.
+    # response instead. Ack always plays at the origin — it means "I heard
+    # you", which is true regardless of where the eventual response goes.
     if intent_name != "unknown":
         ack_task = asyncio.create_task(
             audio_io.send_canned("acknowledged", satellite_ip),
@@ -401,7 +435,7 @@ async def dispatch(intent: dict, satellite_ip: str) -> None:
         ack_task = None
 
     try:
-        response_text = await handler(slots, satellite_ip)
+        response_text = await handler(slots, satellite_ip, target_satellites)
     except ClarificationNeeded as clarification:
         # Handler needs more information. Store context, speak the question.
         log.info(
@@ -413,6 +447,7 @@ async def dispatch(intent: dict, satellite_ip: str) -> None:
             slots=clarification.slots,
             missing_slot=clarification.missing_slot,
             question=clarification.question,
+            target_satellites=target_satellites,
         )
         conversation_state.set(satellite_ip, ctx)
 
@@ -421,6 +456,8 @@ async def dispatch(intent: dict, satellite_ip: str) -> None:
         try:
             # listen_after=True — satellite opens mic immediately after the
             # question finishes playing, no wake word needed for the reply.
+            # Always asked at the origin — the clarification is a
+            # conversation with whoever spoke, not with target_satellites.
             await send_to_tts(clarification.question, satellite_ip, listen_after=True)
         except (ConnectionError, OSError):
             log.exception("TTS unreachable when asking clarification question")
@@ -438,11 +475,35 @@ async def dispatch(intent: dict, satellite_ip: str) -> None:
         await ack_task
 
     if response_text is not None:
+        await _broadcast_response(response_text, target_satellites, origin_ip=satellite_ip)
+
+
+async def _broadcast_response(text: str, target_satellites: list[str], origin_ip: str) -> None:
+    """
+    Send `text` to every satellite in target_satellites.
+
+    A failure delivering to one target is logged and does not stop delivery
+    to the others. If any delivery fails, a single canned error is sent to
+    origin_ip afterwards — the speaker should always find out something
+    went wrong even if the request was routed elsewhere and they never
+    heard the failure themselves.
+    """
+    any_failed = False
+    for target_ip in target_satellites:
         try:
-            await send_to_tts(response_text, satellite_ip)
+            await send_to_tts(text, target_ip)
         except (ConnectionError, OSError):
-            log.exception("TTS service unreachable or failed for intent %r", intent_name)
-            await audio_io.send_canned("error", satellite_ip)
+            log.exception("TTS service unreachable or failed delivering to %s", target_ip)
+            any_failed = True
+
+    if any_failed:
+        try:
+            await audio_io.send_canned("error", origin_ip)
+        except (ConnectionError, OSError):
+            log.exception(
+                "Could not reach origin satellite %s to report a delivery failure",
+                origin_ip,
+            )
 
 # ---------------------------------------------------------------------------
 # Trigger polling loop
@@ -458,7 +519,9 @@ async def trigger_poller() -> None:
     """
     Background task. Wakes every TRIGGER_POLL_INTERVAL seconds, checks for
     due triggers in the database, asks the owning skill's TriggerHandler
-    for announcement text, and sends it to the trigger's satellite_ip.
+    for announcement text, and broadcasts it to every IP in the trigger's
+    target_satellites (falling back to origin_satellite_ip for error
+    reporting, same as the immediate-response path in dispatch()).
 
     Runs for the lifetime of the process. Errors on any individual trigger
     (missing handler, handler exception, TTS failure) are logged and
@@ -474,8 +537,9 @@ async def trigger_poller() -> None:
 
         for trigger in due:
             log.info(
-                "Trigger fired: id=%d skill=%r trigger_key=%r satellite=%s",
-                trigger.id, trigger.skill, trigger.trigger_key, trigger.satellite_ip,
+                "Trigger fired: id=%d skill=%r trigger_key=%r origin=%s targets=%s",
+                trigger.id, trigger.skill, trigger.trigger_key,
+                trigger.origin_satellite_ip, trigger.target_satellites,
             )
 
             # Mark fired immediately — if the handler or TTS fails below, we
@@ -509,20 +573,9 @@ async def trigger_poller() -> None:
                 # Skill handled its own output (or has nothing to say).
                 continue
 
-            try:
-                await send_to_tts(announcement, trigger.satellite_ip)
-            except (ConnectionError, OSError):
-                log.exception(
-                    "TTS unreachable when announcing trigger id=%d (skill=%r) to %s",
-                    trigger.id, trigger.skill, trigger.satellite_ip,
-                )
-                try:
-                    await audio_io.send_canned("error", trigger.satellite_ip)
-                except (ConnectionError, OSError):
-                    log.exception(
-                        "Could not reach satellite %s for trigger id=%d — announcement lost",
-                        trigger.satellite_ip, trigger.id,
-                    )
+            await _broadcast_response(
+                announcement, trigger.target_satellites, origin_ip=trigger.origin_satellite_ip,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +591,57 @@ def satellite_name_from_ip(ip: str) -> str | None:
 
 def satellite_ip_from_name(name: str) -> str | None:
     return SATELLITES.get(name)
+
+
+def _resolve_target_satellites(raw_targets, origin_ip: str) -> list[str]:
+    """
+    Turn whatever the LLM extracted for "target_satellites" into a
+    deduplicated list of satellite IPs.
+
+    raw_targets is expected to be a list of room-name strings (per the
+    intent-extraction prompt), but this tolerates a bare string, a missing
+    key, or garbage from a small/uncooperative model rather than raising.
+
+    Room names are matched case-insensitively and with spaces treated the
+    same as underscores, so "living room" matches "living_room" in
+    SATELLITES. An unrecognised name is dropped (and logged) rather than
+    causing the whole request to fail — one bad name shouldn't cancel a
+    request that also named a good one.
+
+    Defaults to [origin_ip] only when the user named no *valid* target at
+    all. If they explicitly named a room, even a single one, the response
+    goes only there — see voice-assistant-refactor-2026-07-02.md, Part 2,
+    "Why this design, and not something else" for why origin is never
+    silently added alongside an explicit target.
+    """
+    if isinstance(raw_targets, str):
+        raw_targets = [raw_targets]
+    elif not isinstance(raw_targets, list):
+        raw_targets = []
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_targets:
+        raw = str(raw).strip()
+        if not raw:
+            continue
+
+        # Accept a friendly name (normalised) or, tolerantly, a raw IP if
+        # the model returned one directly.
+        name_key = raw.lower().replace(" ", "_")
+        ip = SATELLITES.get(name_key)
+        if ip is None and raw in _IP_TO_NAME:
+            ip = raw
+
+        if ip is None:
+            log.warning("Unrecognised target satellite %r — ignoring", raw)
+            continue
+
+        if ip not in seen:
+            seen.add(ip)
+            resolved.append(ip)
+
+    return resolved if resolved else [origin_ip]
 
 
 # ---------------------------------------------------------------------------
@@ -625,12 +729,15 @@ async def handle_connection(
             # Slot filled successfully. Clear context and re-dispatch with completed slots.
             conversation_state.clear(satellite_ip)
             intent = {"intent": ctx.intent, "slots": updated_slots}
-            await dispatch(intent, satellite_ip)
+            await dispatch(intent, satellite_ip, ctx.target_satellites)
             return
 
         # No pending clarification — normal intent extraction path.
         intent = extract_intent(text)
-        await dispatch(intent, satellite_ip)
+        target_satellites = _resolve_target_satellites(
+            intent.get("target_satellites", []), satellite_ip,
+        )
+        await dispatch(intent, satellite_ip, target_satellites)
 
     except (ConnectionResetError, asyncio.IncompleteReadError):
         log.warning("Connection from %s dropped unexpectedly", peer)

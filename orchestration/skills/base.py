@@ -67,12 +67,29 @@ class Skill:
                   array") into this block rather than relying on a shared
                   rule elsewhere, since this block is the only thing that
                   travels with the skill.
-    handler:      async def (slots: dict, satellite_ip: str) -> str | None.
+    handler:      async def (slots: dict, satellite_ip: str,
+                  target_satellites: list[str]) -> str | None.
                   Return a string to be spoken via TTS, or None if the
                   skill already handled all the audio output itself.
                   Raise ClarificationNeeded for a missing required slot —
                   the orchestrator asks the question and routes the reply
                   back through slot_specs below.
+
+                  satellite_ip is the satellite that heard the command (the
+                  origin) — use it for anything that should always go back
+                  to the speaker regardless of routing (side effects,
+                  logging, a future intercom skill's reply-to-sender path).
+
+                  target_satellites is where the orchestrator will actually
+                  deliver your returned text — already resolved from
+                  whatever the user said (e.g. "in the kitchen" ->
+                  ["<kitchen ip>"]), defaulting to [satellite_ip] if they
+                  named nowhere. Most skills can ignore this parameter
+                  entirely and just return text — the orchestrator handles
+                  delivery to every target for you. Only inspect it
+                  yourself if your skill needs the destination for some
+                  other reason (e.g. storing it in a trigger payload, the
+                  way skills/timer.py does).
     slot_specs:   slot name -> SlotSpec, for any slot this skill might ask
                   the user to clarify. Keyed by plain slot name here — the
                   registry namespaces it to (intent, slot) automatically,
@@ -81,7 +98,7 @@ class Skill:
     """
     intent: str
     prompt_block: str
-    handler: Callable[[dict, str], Awaitable[str | None]]
+    handler: Callable[[dict, str, list[str]], Awaitable[str | None]]
     slot_specs: dict[str, SlotSpec] = field(default_factory=dict)
 
 

@@ -87,6 +87,12 @@ class ClarificationContext:
     slots: dict                    # slots gathered so far
     missing_slot: str              # the slot we are still waiting for
     question: str                  # what was asked (for logging / re-ask)
+    target_satellites: list        # resolved IPs from the original request — see
+                                    # orchestration._resolve_target_satellites().
+                                    # Carried across the clarification turn so
+                                    # "set a timer in the kitchen" for 5
+                                    # minutes" doesn't lose "kitchen" just
+                                    # because the duration needed a follow-up.
     turn: int = 0                  # how many clarifying questions have been asked
     created_at: float = field(default_factory=time.monotonic)
 
