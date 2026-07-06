@@ -12,12 +12,20 @@ rather than skill-owned persistence (contrast with skills/lists.py, which
 owns its own table end to end).
 
 This module deliberately does NOT know what a "timer" is, or what any other
-skill's trigger means. Two things about a trigger are core concerns and get
-real columns:
-  - `fires_at`     — when, because the poller has to index/query on it.
-  - `satellite_ip` — where any resulting announcement gets delivered, because
-    routing audio to a satellite is core infrastructure (orchestration.py /
-    audio_io.py), not skill semantics.
+skill's trigger means. A few things about a trigger are core concerns and
+get real columns:
+  - `fires_at`             — when, because the poller has to index/query on it.
+  - `origin_satellite_ip`  — which satellite originally heard the request
+    that scheduled this trigger. Kept even though it may not be where the
+    announcement plays, because a skill may still need it later (e.g. an
+    error notification, or an intercom-style skill wanting to reply to
+    whoever spoke).
+  - `target_satellites`    — where the resulting announcement should
+    actually be delivered when the trigger fires (usually just the origin,
+    but "set a timer in the kitchen" targets the kitchen instead). Routing
+    audio to satellites is core infrastructure (orchestration.py /
+    audio_io.py), not skill semantics, so both of these are real columns
+    rather than being buried in the opaque payload below.
 Everything else about what the trigger means is the skill's business and
 lives in `payload`, a JSON blob this module stores and hands back without
 ever inspecting its contents.
@@ -87,13 +95,14 @@ _CORE_SCHEMA = """
 -- are not initialised here either.
 
 CREATE TABLE IF NOT EXISTS triggers (
-    id           INTEGER PRIMARY KEY,
-    skill        TEXT    NOT NULL,               -- opaque skill identifier, matches TriggerHandler.skill_name
-    trigger_key  TEXT    NOT NULL,                -- skill-local key, not interpreted by the core (lets a skill find/cancel its own trigger later)
-    fires_at     TEXT    NOT NULL,                -- UTC ISO 8601
-    satellite_ip TEXT    NOT NULL,                -- where to deliver the resulting announcement
-    payload      TEXT    NOT NULL DEFAULT '{}',   -- opaque JSON owned by the skill
-    fired        INTEGER NOT NULL DEFAULT 0
+    id                 INTEGER PRIMARY KEY,
+    skill              TEXT    NOT NULL,               -- opaque skill identifier, matches TriggerHandler.skill_name
+    trigger_key        TEXT    NOT NULL,                -- skill-local key, not interpreted by the core (lets a skill find/cancel its own trigger later)
+    fires_at           TEXT    NOT NULL,                -- UTC ISO 8601
+    origin_satellite_ip TEXT   NOT NULL,                -- satellite that made the original request
+    target_satellites  TEXT    NOT NULL DEFAULT '[]',   -- JSON array of IPs to announce to when this fires
+    payload            TEXT    NOT NULL DEFAULT '{}',   -- opaque JSON owned by the skill
+    fired              INTEGER NOT NULL DEFAULT 0
 );
 
 -- Speeds up the poller's "find due, unfired triggers" query.
@@ -216,14 +225,16 @@ def get_connection() -> sqlite3.Connection:
 @dataclass(frozen=True)
 class Trigger:
     """
-    One due (or pending) row from the triggers table, with `payload` already
-    decoded from JSON so callers never touch the storage format directly.
+    One due (or pending) row from the triggers table, with `payload` and
+    `target_satellites` already decoded from JSON so callers never touch
+    the storage format directly.
     """
     id: int
     skill: str
     trigger_key: str
     fires_at: datetime
-    satellite_ip: str
+    origin_satellite_ip: str
+    target_satellites: list[str]
     payload: dict
 
 
@@ -231,39 +242,53 @@ def add_trigger(
     skill: str,
     trigger_key: str,
     fires_at: datetime,
-    satellite_ip: str,
+    origin_satellite_ip: str,
+    target_satellites: list[str] | None = None,
     payload: dict | None = None,
 ) -> int:
     """
     Schedule a future event and return its row id.
 
-    skill        — identifier matching a registered TriggerHandler.skill_name
-                   (see skills/registry.py). The poller uses this to look up
-                   which handler to call when the trigger fires.
-    trigger_key  — skill-local identifier (e.g. a label or generated id).
-                   Never interpreted by the core; it exists so a skill can
-                   later find or cancel its own trigger without needing a
-                   bespoke lookup function added here.
-    fires_at     — must be a UTC-aware datetime; stored as an ISO 8601 string.
-    satellite_ip — where the resulting announcement should be delivered when
-                   the trigger fires. This is a real column (not part of
-                   payload) because routing audio to a satellite is core
-                   delivery infrastructure, not skill semantics.
-    payload      — arbitrary JSON-serialisable dict owned entirely by the
-                   skill. Stored and returned verbatim; the core never reads
-                   or interprets its contents.
+    skill                — identifier matching a registered TriggerHandler.
+                           skill_name (see skills/registry.py). The poller
+                           uses this to look up which handler to call when
+                           the trigger fires.
+    trigger_key          — skill-local identifier (e.g. a label or generated
+                           id). Never interpreted by the core; it exists so
+                           a skill can later find or cancel its own trigger
+                           without needing a bespoke lookup function added
+                           here.
+    fires_at             — must be a UTC-aware datetime; stored as an ISO
+                           8601 string.
+    origin_satellite_ip  — the satellite that made the original request.
+                           Not necessarily where the announcement plays —
+                           see target_satellites — but kept around for
+                           anything that should always go back to whoever
+                           asked (error notifications, future intercom-style
+                           reply-to-sender use cases).
+    target_satellites    — list of satellite IPs the announcement should be
+                           delivered to when the trigger fires. Defaults to
+                           [origin_satellite_ip] if omitted or empty — the
+                           same "no target named, assume origin" rule
+                           orchestration.py applies to immediate responses.
+    payload              — arbitrary JSON-serialisable dict owned entirely by
+                           the skill. Stored and returned verbatim; the core
+                           never reads or interprets its contents.
     """
     fires_at_str = fires_at.astimezone(timezone.utc).isoformat()
+    resolved_targets = list(target_satellites) if target_satellites else [origin_satellite_ip]
+    targets_str = json.dumps(resolved_targets)
     payload_str = json.dumps(payload or {})
     cur = _db().execute(
-        "INSERT INTO triggers (skill, trigger_key, fires_at, satellite_ip, payload, fired) "
-        "VALUES (?, ?, ?, ?, ?, 0)",
-        (skill, trigger_key, fires_at_str, satellite_ip, payload_str),
+        "INSERT INTO triggers "
+        "(skill, trigger_key, fires_at, origin_satellite_ip, target_satellites, payload, fired) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0)",
+        (skill, trigger_key, fires_at_str, origin_satellite_ip, targets_str, payload_str),
     )
     _db().commit()
     log.debug(
-        "Trigger added: id=%d skill=%r trigger_key=%r fires_at=%s satellite=%s",
-        cur.lastrowid, skill, trigger_key, fires_at_str, satellite_ip,
+        "Trigger added: id=%d skill=%r trigger_key=%r fires_at=%s origin=%s targets=%s",
+        cur.lastrowid, skill, trigger_key, fires_at_str, origin_satellite_ip, resolved_targets,
     )
     return cur.lastrowid
 
@@ -271,14 +296,15 @@ def add_trigger(
 def get_due_triggers(now: datetime) -> list[Trigger]:
     """
     Return all unfired triggers whose fires_at is at or before `now`, as
-    Trigger objects with `payload` already decoded from JSON.
+    Trigger objects with `payload` and `target_satellites` already decoded
+    from JSON.
 
     `now` should be UTC-aware; compared as ISO 8601 strings (sorts correctly).
     """
     now_str = now.astimezone(timezone.utc).isoformat()
     rows = _db().execute(
-        "SELECT id, skill, trigger_key, fires_at, satellite_ip, payload FROM triggers "
-        "WHERE fired = 0 AND fires_at <= ?",
+        "SELECT id, skill, trigger_key, fires_at, origin_satellite_ip, target_satellites, payload "
+        "FROM triggers WHERE fired = 0 AND fires_at <= ?",
         (now_str,),
     ).fetchall()
 
@@ -292,12 +318,24 @@ def get_due_triggers(now: datetime) -> list[Trigger]:
                 row["id"], row["skill"],
             )
             payload = {}
+        try:
+            target_satellites = json.loads(row["target_satellites"])
+            if not target_satellites:
+                raise ValueError("empty")
+        except (json.JSONDecodeError, ValueError):
+            log.error(
+                "Trigger id=%d (skill=%r) has unparseable/empty target_satellites — "
+                "falling back to origin %s",
+                row["id"], row["skill"], row["origin_satellite_ip"],
+            )
+            target_satellites = [row["origin_satellite_ip"]]
         due.append(Trigger(
             id=row["id"],
             skill=row["skill"],
             trigger_key=row["trigger_key"],
             fires_at=datetime.fromisoformat(row["fires_at"]),
-            satellite_ip=row["satellite_ip"],
+            origin_satellite_ip=row["origin_satellite_ip"],
+            target_satellites=target_satellites,
             payload=payload,
         ))
     return due

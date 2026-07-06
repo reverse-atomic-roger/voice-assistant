@@ -91,7 +91,7 @@ def _format_duration(duration_seconds: int) -> str:
     return ", ".join(parts) if parts else "0 seconds"
 
 
-async def handle(slots: dict, satellite_ip: str) -> str | None:
+async def handle(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
     slots = _normalize_duration(slots)
     duration = int(slots.get("duration_seconds", 0) or 0)
 
@@ -122,12 +122,15 @@ async def handle(slots: dict, satellite_ip: str) -> str | None:
         skill="timer",
         trigger_key=label,
         fires_at=fires_at,
-        satellite_ip=satellite_ip,
+        origin_satellite_ip=satellite_ip,
+        target_satellites=target_satellites,
         payload={"label": label},
     )
 
-    log.info("Timer set: label=%r duration=%ds fires_at=%s satellite=%s",
-             label, duration, fires_at.isoformat(), satellite_ip)
+    log.info(
+        "Timer set: label=%r duration=%ds fires_at=%s origin=%s targets=%s",
+        label, duration, fires_at.isoformat(), satellite_ip, target_satellites,
+    )
 
     return f"Timer set. {duration_str} remaining."
 
