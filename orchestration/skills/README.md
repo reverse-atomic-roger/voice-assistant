@@ -1,13 +1,16 @@
 # Writing a skill
 
-A skill is one Python file that teaches the assistant a new intent —
-"play a song", "search the logs", whatever you need. Once it's written,
-enabling it is two lines in `skills/registry.py`. Nothing else in the
-orchestrator needs to change.
+A skill is one Python file that teaches the assistant one or more new
+intents — "play a song", "search the logs", a whole family like "play",
+"pause", "skip", "queue" for a music skill. Once it's written, enabling the
+entire module — however many intents it defines — is one line in
+`skills/registry.py`. Nothing else in the orchestrator needs to change.
 
 ## The contract
 
-A skill is one or more module-level `Skill` objects:
+A skill is one or more module-level `Skill` objects, collected into one
+module-level `SKILLS` list — that list, not the individual `Skill` objects,
+is what `skills/registry.py` reads:
 
 ```python
 from skills.base import Skill, SlotSpec, ClarificationNeeded, parse_value_string
@@ -29,7 +32,7 @@ async def handle(slots: dict, satellite_ip: str, target_satellites: list[str]) -
     # ... do the thing ...
     return f"Playing {song}."
 
-SKILL = Skill(
+SKILL_PLAY = Skill(
     intent="play_music",
     prompt_block=PROMPT_BLOCK,
     handler=handle,
@@ -43,9 +46,16 @@ SKILL = Skill(
         ),
     },
 )
+
+# Every intent this module handles, gathered in one place. A one-intent
+# skill still needs this — it's just a one-element list — so the
+# convention stays the same whether your module has one intent or ten.
+# Add "pause_music", "skip_music", etc. later and this list is the only
+# thing in this file that grows; skills/registry.py doesn't change at all.
+SKILLS = [SKILL_PLAY]
 ```
 
-That's the whole interface. Three pieces:
+That's the whole interface. Four pieces:
 
 - **`prompt_block`** — tells the small intent-extraction LLM your intent
   exists and what slots it has. Two-space indent for the intent name,
@@ -75,23 +85,31 @@ That's the whole interface. Three pieces:
   parser only if the slot needs real decomposition (see `parse_duration` in
   `skills/base.py` for why timer durations get one: the LLM is never asked
   to do arithmetic, only to report the raw units the user said).
+- **`SKILLS`** — the module-level list of every `Skill` this file defines.
+  Required even for a single-intent module (`SKILLS = [SKILL]`) — this is
+  what `skills/registry.py` actually reads, so the registration story is
+  identical whether your module has one intent or ten.
 
 ## Registering it
 
-In `skills/registry.py`:
+In `skills/registry.py`, add your module to `SKILL_MODULES`:
 
 ```python
-from skills import play_music   # 1. import your module
+from skills import lists, timer, unknown, play_music   # 1. import your module
 
-REGISTERED_SKILLS: list[Skill] = [
-    ...,
-    play_music.SKILL,            # 2. add it to the list
-]
+SKILL_MODULES = [timer, lists, unknown, play_music]     # 2. add it here
 ```
 
+That's it — one line, regardless of how many intents `play_music.SKILLS`
+contains. `skills/registry.py` flattens every module's `SKILLS` list into
+the master list orchestration.py dispatches on, so a five-intent music
+skill (play, pause, skip, queue, playlist) is exactly as much work to
+register as a one-intent skill like timer.
+
 The registry validates itself at import time — a duplicate intent name, a
-missing handler, or an empty prompt block will fail loudly at startup
-rather than misbehaving mid-conversation.
+missing handler, an empty prompt block, or a module in `SKILL_MODULES`
+that forgot to define `SKILLS` will all fail loudly at startup rather than
+misbehaving mid-conversation.
 
 ## What you get for free
 
@@ -183,9 +201,10 @@ async def _on_fire(payload: dict) -> str | None:
 TRIGGER = TriggerHandler(skill_name="play_music", on_trigger=_on_fire)
 ```
 
-Then add your module to `SKILL_MODULES` in `skills/registry.py` (alongside
-adding your `Skill` objects to `REGISTERED_SKILLS` as usual). That's the
-whole job — the registry picks up your `TRIGGER` automatically from there.
+Then add your module to `SKILL_MODULES` in `skills/registry.py`, same as
+any other skill (see "Registering it" above) — there's no separate step
+for the trigger side of things. That's the whole job — the registry picks
+up your `TRIGGER` automatically from there.
 
 A few things worth knowing about how this works:
 

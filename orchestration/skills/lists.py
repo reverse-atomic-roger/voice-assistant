@@ -7,6 +7,11 @@ helper, so they live together in one file with several Skill objects
 rather than being artificially split into one file per intent — a skill
 module is the unit of *sharing*, not a hard one-file-per-intent rule.
 
+All four intents are collected into one module-level `SKILLS` list at the
+bottom of this file — that's what skills/registry.py reads, so this whole
+module is one line in SKILL_MODULES there regardless of how many intents
+it grows to.
+
 This module owns its own persistence rather than calling into database.py:
 the `lists` / `list_items` tables and every query against them live right
 here, registered via `database.register_schema()` and run through
@@ -380,3 +385,15 @@ SKILL_LIST_MERGE = Skill(
         ),
     },
 )
+
+# The registry (skills/registry.py) reads this one SKILLS list rather than
+# each SKILL_LIST_* individually — this is the whole reason SKILLS exists as
+# a convention: a module with four related intents is still exactly one
+# line in skills/registry.py's SKILL_MODULES, the same as a one-intent
+# module. Add a fifth list intent later and registry.py doesn't change.
+SKILLS = [
+    SKILL_LIST_ADD,
+    SKILL_LIST_READ,
+    SKILL_LIST_CLEAR,
+    SKILL_LIST_MERGE,
+]

@@ -32,3 +32,5 @@ async def handle(slots: dict, satellite_ip: str, target_satellites: list[str]) -
 
 
 SKILL = Skill(intent="unknown", prompt_block=PROMPT_BLOCK, handler=handle)
+
+SKILLS = [SKILL]
