@@ -2,16 +2,18 @@
 skills/registry.py
 
 The single place to enable a skill. To add one:
-    1. Write skills/your_skill.py, exposing a module-level Skill (or several).
-    2. Import it below.
-    3. Add it to REGISTERED_SKILLS.
-    4. If it schedules future events, add it to SKILL_MODULES too (see
-       "Trigger handlers" below) and expose a module-level TRIGGER.
+    1. Write skills/your_skill.py, exposing a module-level SKILLS list —
+       every intent your skill handles, even if there's only one (see
+       skills/README.md for the per-module contract).
+    2. Add the module to SKILL_MODULES below. That's it — one line, one
+       import, regardless of whether your skill has one intent or fifteen.
 
-That's the whole job — orchestration.py builds its handler table, its
-intent-extraction prompt, its slot-fill registry, and its trigger-handler
-table from this file at import time. Nothing else in the codebase needs to
-change.
+SKILL_MODULES is the only hand-maintained list in this file. Everything
+else — the flat REGISTERED_SKILLS list orchestration.py dispatches on, the
+intent-extraction prompt, the slot-fill registry, and the trigger-handler
+table — is derived from it at import time. A five-intent skill (play,
+pause, skip, queue, playlist, say) is still exactly one entry here, the
+same as a one-intent skill like timer.
 
 This is a deliberately explicit, hand-edited list rather than directory
 auto-scanning. A skill is arbitrary Python with full access to the database
@@ -22,7 +24,7 @@ a folder.
 
 Trigger handlers
 -----------------
-Any registered skill module can additionally expose a module-level
+Any module in SKILL_MODULES can additionally expose a module-level
 `TRIGGER = TriggerHandler(...)` (see skills/base.py) if it needs to do
 something at a future time — a countdown, a scheduled announcement, etc.
 skills/timer.py is the one built-in example. This registry scans
@@ -38,25 +40,39 @@ from skills.base import Skill, TriggerHandler
 
 # To enable a shared/community skill:
 #   from skills import play_music
-# ...then add play_music.SKILL to REGISTERED_SKILLS below, and play_music
-# to SKILL_MODULES too if it exposes a TRIGGER.
+# ...then add play_music to the list below. Its whole SKILLS list (however
+# many intents it defines) and its TRIGGER (if any) come along for free.
+SKILL_MODULES = [timer, lists, unknown]
 
 log = logging.getLogger(__name__)
 
-REGISTERED_SKILLS: list[Skill] = [
-    timer.SKILL,
-    lists.SKILL_LIST_ADD,
-    lists.SKILL_LIST_READ,
-    lists.SKILL_LIST_CLEAR,
-    lists.SKILL_LIST_MERGE,
-    unknown.SKILL,
-]
 
-# Every module that backs a registered skill, scanned below for an optional
-# module-level TRIGGER. Listed separately from REGISTERED_SKILLS because a
-# module can expose several Skill objects (see lists.py) but at most one
-# TRIGGER — modules, not intents, are what own a trigger handler.
-SKILL_MODULES = [timer, lists, unknown]
+def _collect_registered_skills(modules: list) -> list[Skill]:
+    """
+    Flatten every module's SKILLS list into the one master list
+    orchestration.py dispatches on. This is the only place per-intent Skill
+    objects get assembled — a module contributes as many intents as it
+    likes by putting them all in one SKILLS list, so adding a five-intent
+    skill to the assistant is one line in SKILL_MODULES, not five lines
+    here.
+    """
+    collected: list[Skill] = []
+    for module in modules:
+        module_skills = getattr(module, "SKILLS", None)
+        if module_skills is None:
+            raise RuntimeError(
+                f"{module.__name__} is listed in SKILL_MODULES but has no "
+                f"module-level SKILLS list. Every skill module must expose "
+                f"SKILLS: list[Skill], even if it only defines one intent — "
+                f"see skills/README.md."
+            )
+        if not isinstance(module_skills, list) or not module_skills:
+            raise RuntimeError(
+                f"{module.__name__}.SKILLS must be a non-empty list of Skill objects, "
+                f"got {module_skills!r}"
+            )
+        collected.extend(module_skills)
+    return collected
 
 
 def _validate(skills: list[Skill]) -> None:
@@ -71,8 +87,8 @@ def _validate(skills: list[Skill]) -> None:
             raise RuntimeError(f"Skill has an empty intent name: {skill!r}")
         if skill.intent in seen_intents:
             raise RuntimeError(
-                f"Duplicate intent {skill.intent!r} registered more than once "
-                f"in REGISTERED_SKILLS — intent names must be unique."
+                f"Duplicate intent {skill.intent!r} registered more than once — "
+                f"intent names must be unique across every module in SKILL_MODULES."
             )
         seen_intents.add(skill.intent)
 
@@ -88,8 +104,8 @@ def _validate(skills: list[Skill]) -> None:
     if "unknown" not in seen_intents:
         raise RuntimeError(
             "No skill registered for intent 'unknown' — dispatch's fallback "
-            "handler depends on it being present. Don't remove skills/unknown.py "
-            "from REGISTERED_SKILLS."
+            "handler depends on it being present. Don't remove skills/unknown "
+            "from SKILL_MODULES."
         )
 
     log.info("Loaded %d skill(s): %s", len(skills), sorted(seen_intents))
@@ -133,6 +149,8 @@ def _collect_trigger_handlers(modules: list) -> dict[str, TriggerHandler]:
     log.info("Loaded %d trigger handler(s): %s", len(handlers), sorted(handlers))
     return handlers
 
+
+REGISTERED_SKILLS: list[Skill] = _collect_registered_skills(SKILL_MODULES)
 
 _validate(REGISTERED_SKILLS)
 

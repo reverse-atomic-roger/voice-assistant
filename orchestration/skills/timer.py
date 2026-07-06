@@ -174,3 +174,9 @@ SKILL = Skill(
         ),
     },
 )
+
+# The registry (skills/registry.py) reads SKILLS, not SKILL, when it builds
+# the flat REGISTERED_SKILLS list — a one-intent module like this still
+# needs the list, even though it only has one element, so that adding a
+# multi-intent skill elsewhere doesn't require a different convention.
+SKILLS = [SKILL]
