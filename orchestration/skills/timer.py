@@ -149,6 +149,51 @@ async def _on_timer_trigger(payload: dict) -> str:
 TRIGGER = TriggerHandler(skill_name="timer", on_trigger=_on_timer_trigger)
 
 
+PROMPT_BLOCK_CHECK_TIMER = """\
+  check_timer
+    label  (string, optional) which timer to check, only if the user named one
+
+    Use this when the user asks how much time is left, whether a timer is
+    still running, or to check on a timer — not to set a new one.
+"""
+
+
+async def handle_check_timer(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
+    label = slots.get("label", "")
+    label = label.strip() if isinstance(label, str) else ""
+
+    pending = database.get_pending_triggers(skill="timer")
+    if not pending:
+        return "You don't have any timers running."
+
+    now = datetime.now(timezone.utc)
+
+    if label:
+        matches = [t for t in pending if label.lower() in t.payload.get("label", "").lower()]
+        if not matches:
+            others = ", ".join(t.payload.get("label", "a timer") for t in pending)
+            return f"I couldn't find a timer called {label}. You have: {others}."
+        pending = matches
+
+    if len(pending) == 1:
+        remaining = max(0, int((pending[0].fires_at - now).total_seconds()))
+        timer_label = pending[0].payload.get("label", "Timer")
+        return f"{timer_label.capitalize()} has {_format_duration(remaining)} left."
+
+    parts = [
+        f"{t.payload.get('label', 'a timer')}: {_format_duration(max(0, int((t.fires_at - now).total_seconds())))}"
+        for t in pending
+    ]
+    return "You have multiple timers running. " + "; ".join(parts) + "."
+
+
+SKILL_CHECK_TIMER = Skill(
+    intent="check_timer",
+    prompt_block=PROMPT_BLOCK_CHECK_TIMER,
+    handler=handle_check_timer,
+)
+
+
 SKILL = Skill(
     intent="timer",
     prompt_block=PROMPT_BLOCK,
@@ -179,4 +224,6 @@ SKILL = Skill(
 # the flat REGISTERED_SKILLS list — a one-intent module like this still
 # needs the list, even though it only has one element, so that adding a
 # multi-intent skill elsewhere doesn't require a different convention.
-SKILLS = [SKILL]
+# check_timer is optional-slot-only (no ClarificationNeeded path), so it
+# needs no entry of its own in any slot_specs dict.
+SKILLS = [SKILL, SKILL_CHECK_TIMER]

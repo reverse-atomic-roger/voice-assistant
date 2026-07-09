@@ -292,6 +292,43 @@ def add_trigger(
     )
     return cur.lastrowid
 
+def _trigger_from_row(row: sqlite3.Row) -> Trigger:
+    """
+    Shared row -> Trigger decoding used by both get_due_triggers() and
+    get_pending_triggers(), so the payload/target_satellites JSON-decode
+    fallback logic lives in exactly one place.
+    """
+    try:
+        payload = json.loads(row["payload"])
+    except json.JSONDecodeError:
+        log.error(
+            "Trigger id=%d (skill=%r) has unparseable payload — treating as {}",
+            row["id"], row["skill"],
+        )
+        payload = {}
+    try:
+        target_satellites = json.loads(row["target_satellites"])
+        if not target_satellites:
+            raise ValueError("empty")
+    except (json.JSONDecodeError, ValueError):
+        log.error(
+            "Trigger id=%d (skill=%r) has unparseable/empty target_satellites — "
+            "falling back to origin %s",
+            row["id"], row["skill"], row["origin_satellite_ip"],
+        )
+        target_satellites = [row["origin_satellite_ip"]]
+    return Trigger(
+        id=row["id"],
+        skill=row["skill"],
+        trigger_key=row["trigger_key"],
+        fires_at=datetime.fromisoformat(row["fires_at"]),
+        origin_satellite_ip=row["origin_satellite_ip"],
+        target_satellites=target_satellites,
+        payload=payload,
+    )
+
+
+
 
 def get_due_triggers(now: datetime) -> list[Trigger]:
     """
@@ -307,39 +344,24 @@ def get_due_triggers(now: datetime) -> list[Trigger]:
         "FROM triggers WHERE fired = 0 AND fires_at <= ?",
         (now_str,),
     ).fetchall()
+    return [_trigger_from_row(row) for row in rows]
 
-    due: list[Trigger] = []
-    for row in rows:
-        try:
-            payload = json.loads(row["payload"])
-        except json.JSONDecodeError:
-            log.error(
-                "Trigger id=%d (skill=%r) has unparseable payload — treating as {}",
-                row["id"], row["skill"],
-            )
-            payload = {}
-        try:
-            target_satellites = json.loads(row["target_satellites"])
-            if not target_satellites:
-                raise ValueError("empty")
-        except (json.JSONDecodeError, ValueError):
-            log.error(
-                "Trigger id=%d (skill=%r) has unparseable/empty target_satellites — "
-                "falling back to origin %s",
-                row["id"], row["skill"], row["origin_satellite_ip"],
-            )
-            target_satellites = [row["origin_satellite_ip"]]
-        due.append(Trigger(
-            id=row["id"],
-            skill=row["skill"],
-            trigger_key=row["trigger_key"],
-            fires_at=datetime.fromisoformat(row["fires_at"]),
-            origin_satellite_ip=row["origin_satellite_ip"],
-            target_satellites=target_satellites,
-            payload=payload,
-        ))
-    return due
+def get_pending_triggers(skill: str) -> list[Trigger]:
+    """
+    Return every not-yet-fired trigger scheduled by `skill`, regardless of
+    whether fires_at has passed yet — unlike get_due_triggers(), which is
+    only for the poller's "what's ready to fire right now" sweep. This is
+    for a skill asking "what's still pending for me?" (e.g. timer.py's
+    check_timer intent querying its own outstanding timers).
 
+    Ordered by fires_at ascending, so the soonest-to-fire trigger is first.
+    """
+    rows = _db().execute(
+        "SELECT id, skill, trigger_key, fires_at, origin_satellite_ip, target_satellites, payload "
+        "FROM triggers WHERE fired = 0 AND skill = ? ORDER BY fires_at ASC",
+        (skill,),
+    ).fetchall()
+    return [_trigger_from_row(row) for row in rows]
 
 def mark_trigger_fired(trigger_id: int) -> None:
     """Mark a trigger as fired so the poller doesn't re-announce it."""
