@@ -329,6 +329,7 @@ SKILL_LIST_ADD = Skill(
     intent="list_add",
     prompt_block=PROMPT_BLOCK_ADD,
     handler=handle_add,
+    router_hint="Add one or more items to a named list, like a shopping or todo list.",
     slot_specs={
         "list_name": SlotSpec(description=_LIST_NAME_DESCRIPTION, parse=parse_value_string),
         "list_items": SlotSpec(
@@ -348,6 +349,7 @@ SKILL_LIST_READ = Skill(
     intent="list_read",
     prompt_block=PROMPT_BLOCK_READ,
     handler=handle_read,
+    router_hint="Read out the items currently on a named list.",
     slot_specs={
         "list_name": SlotSpec(description=_LIST_NAME_DESCRIPTION, parse=parse_value_string),
     },
@@ -357,6 +359,7 @@ SKILL_LIST_CLEAR = Skill(
     intent="list_clear",
     prompt_block=PROMPT_BLOCK_CLEAR,
     handler=handle_clear,
+    router_hint="Clear, empty, or delete every item on a named list.",
     slot_specs={
         "list_name": SlotSpec(description=_LIST_NAME_DESCRIPTION, parse=parse_value_string),
     },
@@ -366,6 +369,7 @@ SKILL_LIST_MERGE = Skill(
     intent="list_merge",
     prompt_block=PROMPT_BLOCK_MERGE,
     handler=handle_merge,
+    router_hint="Move all items from one named list into another list.",
     slot_specs={
         "source_list": SlotSpec(
             description=(

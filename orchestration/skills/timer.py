@@ -198,6 +198,7 @@ SKILL = Skill(
     intent="timer",
     prompt_block=PROMPT_BLOCK,
     handler=handle,
+    router_hint="Set a countdown timer for a duration, optionally labelled.",
     slot_specs={
         "duration_seconds": SlotSpec(
             description=(
