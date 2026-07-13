@@ -65,7 +65,7 @@ log = logging.getLogger(__name__)
 
 # CONFIGURE: root of the music library, shared with music_indexer.py. Paths
 # stored in the `tracks` table are relative to this folder.
-MUSIC_ROOT = Path(__file__).parent.parent / "music"
+MUSIC_ROOT = Path(__file__).parent.parent.parent / "music"
 
 # CONFIGURE: Ollama base URL and embedding model. Must match whatever
 # music_indexer.py used to build track_vectors — a different model produces

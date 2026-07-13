@@ -212,6 +212,44 @@ def _parse_track_no(raw: str) -> int | None:
         return None
 
 
+def backfill_missing_embeddings(conn) -> None:
+    """
+    Retry embedding for any track that already has a mood_text but no
+    matching row in track_vectors — e.g. because Ollama wasn't reachable
+    when that track was first indexed. Does no audio analysis at all, just
+    re-embeds text that's already sitting in the tracks table, so it's
+    cheap to call on every run regardless of whether any new files were
+    found. This is what lets a "fix Ollama, then rerun" recovery actually
+    pick up where it left off, instead of forcing --rebuild (which would
+    needlessly redo every file's audio analysis just to retry embeddings).
+    """
+    rows = conn.execute(
+        "SELECT t.id, t.path, t.mood_text FROM tracks t "
+        "LEFT JOIN track_vectors v ON v.track_id = t.id "
+        "WHERE v.track_id IS NULL AND t.mood_text IS NOT NULL"
+    ).fetchall()
+
+    if not rows:
+        return
+
+    log.info("%d track(s) missing a mood vector — retrying embeddings", len(rows))
+    succeeded = 0
+    for row in rows:
+        try:
+            embedding = _ollama_embed(row["mood_text"])
+        except (urllib.error.URLError, TimeoutError, KeyError) as exc:
+            log.error("Embedding still failing for %s: %s", row["path"], exc)
+            continue
+        conn.execute(
+            "INSERT INTO track_vectors (track_id, embedding) VALUES (?, ?)",
+            (row["id"], music.sqlite_vec.serialize_float32(embedding)),
+        )
+        conn.commit()
+        succeeded += 1
+
+    log.info("Backfilled %d/%d missing mood vector(s)", succeeded, len(rows))
+
+
 def index_library(rebuild: bool = False) -> None:
     database.init()
     music.ensure_vector_store_ready()
@@ -232,69 +270,72 @@ def index_library(rebuild: bool = False) -> None:
     log.info("%d new file(s) to analyze (%d already indexed)", len(to_index), len(existing_paths))
 
     if not to_index:
-        log.info("Nothing new to index")
-        return
+        log.info("No new files to analyze")
+    else:
+        # Analyze everything first so rms_low/rms_high (used for the relative
+        # "low/moderate/high energy" wording) reflect this whole batch, not
+        # whatever file happened to be processed first.
+        analyzed = []
+        for i, path in enumerate(to_index, start=1):
+            rel_path = str(path.relative_to(music.MUSIC_ROOT))
+            log.info("[%d/%d] Analyzing %s", i, len(to_index), rel_path)
+            try:
+                tags = read_tags(path)
+                features = analyze_audio(path)
+            except Exception as exc:
+                log.error("Skipping %s — analysis failed: %s", rel_path, exc)
+                continue
+            analyzed.append((rel_path, tags, features))
 
-    # Analyze everything first so rms_low/rms_high (used for the relative
-    # "low/moderate/high energy" wording) reflect this whole batch, not
-    # whatever file happened to be processed first.
-    analyzed = []
-    for i, path in enumerate(to_index, start=1):
-        rel_path = str(path.relative_to(music.MUSIC_ROOT))
-        log.info("[%d/%d] Analyzing %s", i, len(to_index), rel_path)
-        try:
-            tags = read_tags(path)
-            features = analyze_audio(path)
-        except Exception as exc:
-            log.error("Skipping %s — analysis failed: %s", rel_path, exc)
-            continue
-        analyzed.append((rel_path, tags, features))
+        if not analyzed:
+            log.warning("No files could be analyzed")
+        else:
+            rms_values = sorted(a[2]["rms_mean"] for a in analyzed)
+            rms_low = rms_values[len(rms_values) // 20]
+            rms_high = rms_values[-max(1, len(rms_values) // 20)]
 
-    if not analyzed:
-        log.warning("No files could be analyzed — nothing indexed")
-        return
+            now = datetime.now(timezone.utc).isoformat()
+            indexed_count = 0
+            for rel_path, tags, features in analyzed:
+                mood_text = build_mood_text(tags, features, rms_low, rms_high)
+                try:
+                    embedding = _ollama_embed(mood_text)
+                except (urllib.error.URLError, TimeoutError, KeyError) as exc:
+                    log.error("Embedding failed for %s: %s — track stored without a mood vector", rel_path, exc)
+                    embedding = None
 
-    rms_values = sorted(a[2]["rms_mean"] for a in analyzed)
-    rms_low = rms_values[len(rms_values) // 20]
-    rms_high = rms_values[-max(1, len(rms_values) // 20)]
+                cur = conn.execute(
+                    "INSERT INTO tracks (path, title, artist, album, track_no, duration_s, "
+                    "tempo_bpm, key_name, camelot_key, mood_text, indexed_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        rel_path, tags["title"], tags["artist"], tags["album"],
+                        _parse_track_no(tags["track_no"]), features["duration_s"],
+                        features["tempo_bpm"], features["key_name"], features["camelot_key"],
+                        mood_text, now,
+                    ),
+                )
+                track_id = cur.lastrowid
+                conn.commit()
 
-    now = datetime.now(timezone.utc).isoformat()
-    indexed_count = 0
-    for rel_path, tags, features in analyzed:
-        mood_text = build_mood_text(tags, features, rms_low, rms_high)
-        try:
-            embedding = _ollama_embed(mood_text)
-        except (urllib.error.URLError, TimeoutError, KeyError) as exc:
-            log.error("Embedding failed for %s: %s — track stored without a mood vector", rel_path, exc)
-            embedding = None
+                if embedding is not None:
+                    conn.execute(
+                        "INSERT INTO track_vectors (track_id, embedding) VALUES (?, ?)",
+                        (track_id, music.sqlite_vec.serialize_float32(embedding)),
+                    )
+                    conn.commit()
 
-        cur = conn.execute(
-            "INSERT INTO tracks (path, title, artist, album, track_no, duration_s, "
-            "tempo_bpm, key_name, camelot_key, mood_text, indexed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                rel_path, tags["title"], tags["artist"], tags["album"],
-                _parse_track_no(tags["track_no"]), features["duration_s"],
-                features["tempo_bpm"], features["key_name"], features["camelot_key"],
-                mood_text, now,
-            ),
-        )
-        track_id = cur.lastrowid
-        conn.commit()
+                indexed_count += 1
+                log.info(
+                    "Indexed %s — tempo=%.0f bpm key=%s", rel_path, features["tempo_bpm"], features["key_name"],
+                )
 
-        if embedding is not None:
-            conn.execute(
-                "INSERT INTO track_vectors (track_id, embedding) VALUES (?, ?)",
-                (track_id, music.sqlite_vec.serialize_float32(embedding)),
-            )
-            conn.commit()
+            log.info("Indexing complete: %d track(s) added", indexed_count)
 
-        indexed_count += 1
-        log.info(
-            "Indexed %s — tempo=%.0f bpm key=%s", rel_path, features["tempo_bpm"], features["key_name"],
-        )
-
-    log.info("Indexing complete: %d track(s) added", indexed_count)
+    # Runs every time, new files or not — cheap to check, and it's the only
+    # way a track that lost its embedding to a transient Ollama outage ever
+    # gets a second chance without a full --rebuild.
+    backfill_missing_embeddings(conn)
 
 
 if __name__ == "__main__":
