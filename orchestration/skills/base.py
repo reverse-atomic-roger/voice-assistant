@@ -95,11 +95,28 @@ class Skill:
                   registry namespaces it to (intent, slot) automatically,
                   so slot names only need to be unique within this skill,
                   not across every skill ever written.
+                  router_hint:  one plain-English sentence describing what this intent is
+                  for, used only by intent_router.py to pre-filter which
+                  skills' prompt_blocks get sent to the LLM on a given
+                  request as the number of registered skills grows. This is
+                  NOT shown to the extraction LLM directly and has no
+                  formatting rules to follow — write it the way you'd
+                  describe the intent to a person, e.g. "Play a song,
+                  artist, album, or mood/vibe description." Distinct
+                  intents that are commonly confused with each other (e.g.
+                  play/pause/volume for the same skill) should still get
+                  hints that read as related, since a shortlist that
+                  splits them up defeats the point.
+                  If omitted, the router falls back to the intent name
+                  itself, which is a much weaker signal — see that
+                  module's docstring. Leaving this blank is safe, never a
+                  hard failure, just worse routing.
     """
     intent: str
     prompt_block: str
     handler: Callable[[dict, str, list[str]], Awaitable[str | None]]
     slot_specs: dict[str, SlotSpec] = field(default_factory=dict)
+    router_hint: str = ""
 
 
 @dataclass(frozen=True)

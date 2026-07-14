@@ -43,7 +43,8 @@ slots; see skills/README.md to add a new one.
 
 Dependencies:
     pip install wyoming
-    Ollama must be running and reachable at OLLAMA_BASE_URL.
+    Ollama must be running and reachable at OLLAMA_BASE_URL, with both
+    INTENT_MODEL and intent_router.py's EMBED_MODEL pulled.
     Pre-synthesised .wav files must exist at the configured paths before startup.
 """
 
@@ -63,6 +64,7 @@ from wyoming.event import Event, async_read_event, async_write_event
 import audio_io
 import conversation_state
 import database
+import intent_router
 from conversation_state import ClarificationNeeded
 from skills.base import SlotSpec, parse_value_string
 from skills.registry import REGISTERED_SKILLS, TRIGGER_HANDLERS
@@ -217,12 +219,21 @@ def _build_intent_system_prompt(skills: list) -> str:
     return _INTENT_PROMPT_HEADER + "\n" + satellite_line + "\n" + blocks + _INTENT_PROMPT_FOOTER
 
 
-INTENT_SYSTEM_PROMPT = _build_intent_system_prompt(REGISTERED_SKILLS)
+# Built once from every registered skill — the fallback system prompt used
+# whenever intent_router.shortlist() opts out of filtering (not ready,
+# mid-run embedding failure, or low routing confidence for this
+# transcript). See extract_intent() below for the per-request path, which
+# is what actually runs on a normal, confident request.
+_FULL_INTENT_SYSTEM_PROMPT = _build_intent_system_prompt(REGISTERED_SKILLS)
 
 
-def _call_ollama(transcript: str) -> dict:
+def _call_ollama(transcript: str, system_prompt: str) -> dict:
     """
     POST to the Ollama /api/chat endpoint and return the parsed JSON intent.
+
+    `system_prompt` is built fresh per request from whichever skills
+    intent_router.shortlist() selected (or _FULL_INTENT_SYSTEM_PROMPT, if
+    it opted out of filtering for this request) — see extract_intent().
 
     Raises urllib.error.URLError on network failure, json.JSONDecodeError on
     bad model output, KeyError if the response shape is unexpected. All
@@ -231,7 +242,7 @@ def _call_ollama(transcript: str) -> dict:
     payload = json.dumps({
         "model": INTENT_MODEL,
         "messages": [
-            {"role": "system", "content": INTENT_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user",   "content": transcript},
         ],
         "stream": False,
@@ -257,11 +268,23 @@ def extract_intent(transcript: str) -> dict:
     """
     Ask the small LLM to extract intent from `transcript`.
 
+    Only the skills intent_router.shortlist() selects for this transcript
+    are included in the system prompt — see that module's docstring for
+    why this is a shortlist, not a hard filter, and why it fails open
+    (falls back to every registered skill) whenever it isn't confident.
+
     Returns a dict with at minimum an "intent" key. On any failure, logs the
     error and returns {"intent": "unknown", "slots": {}}.
     """
+
+    shortlisted = intent_router.shortlist(transcript)
+    if shortlisted is None:
+        system_prompt = _FULL_INTENT_SYSTEM_PROMPT
+    else:
+        system_prompt = _build_intent_system_prompt(shortlisted)
+
     try:
-        result = _call_ollama(transcript)
+        result = _call_ollama(transcript, system_prompt)
         log.debug("Intent extracted: %s", result)
         return result
     except (urllib.error.URLError, TimeoutError) as exc:
@@ -783,6 +806,15 @@ async def run() -> None:
 
     log.info("Probing Ollama at %s...", OLLAMA_BASE_URL)
     probe_ollama()  # raises on failure — intentional
+
+    log.info("Building intent router...")
+    if not intent_router.build(REGISTERED_SKILLS):
+        log.warning(
+            "Intent router unavailable — every request will use the full "
+            "skill list (today's behaviour). This is not fatal; see "
+            "intent_router.py's build() docstring."
+        )
+
 
     log.info("Initialising database...")
     database.init()  # raises on failure — intentional

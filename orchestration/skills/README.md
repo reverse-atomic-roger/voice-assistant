@@ -36,6 +36,7 @@ SKILL_PLAY = Skill(
     intent="play_music",
     prompt_block=PROMPT_BLOCK,
     handler=handle,
+    router_hint="Play a song by name.",
     slot_specs={
         "song_title": SlotSpec(
             description=(
@@ -55,7 +56,7 @@ SKILL_PLAY = Skill(
 SKILLS = [SKILL_PLAY]
 ```
 
-That's the whole interface. Four pieces:
+That's the whole interface. Five pieces:
 
 - **`prompt_block`** — tells the small intent-extraction LLM your intent
   exists and what slots it has. Two-space indent for the intent name,
@@ -79,6 +80,14 @@ That's the whole interface. Four pieces:
   every target for you. Only reach for it directly if your skill needs
   the destination for something else, like passing it through to
   `database.add_trigger(...)` the way `skills/timer.py` does.
+- **`router_hint`** — one plain-English sentence describing what the
+  intent is for, e.g. `"Play a song, artist, album, or mood/vibe
+  description."` Used by `intent_router.py` to decide which skills'
+  `prompt_block`s are worth sending to the LLM on a given request as the
+  number of registered skills grows — see "A note on scale" below. Not
+  shown to the extraction LLM and has no formatting rules; write it the
+  way you'd describe the intent to a person. Optional, but skipping it
+  means weaker routing for your skill (a startup warning will say so).
 - **`slot_specs`** — only needed for slots you might ask the user to
   clarify. For a plain string slot, `parse_value_string` covers it; for
   "one or more items", `parse_value_string_list` covers it. Write your own
@@ -240,10 +249,42 @@ your behalf, by design.
 
 ## A note on scale
 
-Every registered skill's `prompt_block` gets concatenated into the *same*
-system prompt sent to the small intent model on every utterance.
-This works comfortably for a handful of skills. If you end up with a large
-number installed at once, a small local model's intent accuracy may start
-to degrade simply from having more options to choose between. Consider a 
-larger or more focused model for intent extraction if accuracy drops below
-acceptable levels
+Every registered skill's `prompt_block` is a *candidate* for the system
+prompt sent to the small intent model — but not every skill's block is
+necessarily included on every request. `skills/registry.py` still builds
+the full list `orchestration.py` could dispatch on, but before a
+transcript reaches the LLM, `intent_router.py` pre-filters that list down
+to the handful of skills whose purpose is closest in meaning to what was
+just said, and only sends *their* `prompt_block`s. This is what keeps a
+growing skill collection from degrading a small local model's intent
+accuracy simply from having more options to choose between on every
+single request.
+
+**Set `router_hint` on every `Skill` you write** (see "The contract"
+above) — the router embeds it once at startup and compares it against the
+embedded transcript at request time, using the same local embedding model
+`skills/music.py` already uses for its mood search
+(`nomic-embed-text`, via Ollama). Skip it and your skill still works, just
+with a weaker fallback signal (its own intent name) — the router logs a
+warning at startup so the gap doesn't go unnoticed.
+
+If your module defines several closely-related intents — `play_music`,
+`pause_music`, `set_volume` all belonging to one music skill, say — write
+`router_hint`s that read as related to each other (all mentioning "music
+playback", for instance). The router's job is finding "requests that are
+probably about the same kind of thing"; hints that don't share vocabulary
+with their own siblings can get shortlisted apart from each other even
+though a user is likely to move between them in the same conversation
+("play some jazz" → "turn it up" → "pause it").
+
+You don't need to worry about the router excluding your skill by mistake
+and breaking it outright: it's deliberately biased toward over-including
+rather than under-including a candidate. It returns a generous number of
+matches, always includes `unknown` regardless of score, and falls back to
+sending *every* registered skill's `prompt_block` — today's un-filtered
+behaviour — whenever it isn't confident about a given transcript (a low
+similarity score, an Ollama hiccup, or the router never having built
+successfully at startup). A missing or vague `router_hint` degrades
+routing quality; it can't take your skill down. See `intent_router.py`'s
+module docstring for the full mechanics, and its `MIN_CONFIDENT_SIMILARITY`
+and `SHORTLIST_SIZE` constants if you're tuning it against real traffic.
