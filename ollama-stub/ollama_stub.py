@@ -35,7 +35,7 @@ PORT = 11434  # default Ollama port
 # CONFIGURE: model names to advertise — must include your INTENT_MODEL prefix
 # and the embedding model used by intent_router.py.
 MODELS = [
-    "qwen2.5:3b",
+    "qwen3:1.7b",
     "llama3.1:8b",
     "nomic-embed-text:latest",
 ]

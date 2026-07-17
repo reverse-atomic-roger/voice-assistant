@@ -89,7 +89,7 @@ SATELLITES: dict[str, str] = {
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 
 # CONFIGURE: small model for intent extraction
-INTENT_MODEL = "qwen2.5:3b"
+INTENT_MODEL = "qwen3:1.7b"
 
 # CONFIGURE: address and port of the TTS service
 TTS_HOST = "127.0.0.1"
