@@ -248,6 +248,10 @@ def _call_ollama(transcript: str, system_prompt: str) -> dict:
         "stream": False,
         "format": "json",
         "options": {"temperature": 0.0},
+        # Qwen3 is a hybrid reasoning model and thinks by default, which adds
+        # several seconds of hidden <think> tokens before the JSON output —
+        # never needed for slot-style intent extraction.
++       "think": False,
     }).encode()
 
     req = urllib.request.Request(
@@ -367,6 +371,7 @@ def _call_ollama_slot_fill(reply: str, intent: str, missing_slot: str) -> dict:
         "stream": False,
         "format": "json",
         "options": {"temperature": 0.0},
+        "think": False,
     }).encode()
 
     req = urllib.request.Request(
