@@ -54,8 +54,18 @@ import pyaudio
 # Configuration
 # ---------------------------------------------------------------------------
 
-# CONFIGURE: PyAudio input device index (run `python -m sounddevice` to list)
-MIC_DEVICE_INDEX = 17
+# CONFIGURE: PyAudio input device index. None = system default input.
+#
+# Raw indices (e.g. 17) are NOT stable identifiers — PortAudio's ALSA
+# enumeration shifts depending on what's currently loaded (PipeWire virtual
+# devices, plugins like dmix/vdownmix, etc.), so a hardcoded index can end
+# up pointing at a completely different — and possibly non-capturable —
+# device after something as unrelated as an mpd/PipeWire restart. Leave
+# this as None to always resolve to the system's actual current default
+# input device at startup, same convention as OUTPUT_DEVICE_INDEX below.
+# Only set a specific index if you need to pick a *non-default* input
+# device on a machine with several mics.
+MIC_DEVICE_INDEX = None
 
 # CONFIGURE: PyAudio output device index. None = system default output.
 OUTPUT_DEVICE_INDEX = None
@@ -162,12 +172,40 @@ def init() -> None:
         raise RuntimeError("audio_io.init() called more than once")
 
     _pa = pyaudio.PyAudio()
+
+    # Resolve which device we're actually about to open, and sanity-check it
+    # before handing it to PortAudio. A device with maxInputChannels == 0
+    # (e.g. an output-only or plugin/downmix entry) can't be captured from —
+    # PortAudio's ALSA backend has been known to segfault on read() from
+    # such a device rather than raise a catchable error, so we check this
+    # ourselves and raise a clear, debuggable exception instead.
+    if MIC_DEVICE_INDEX is None:
+        device_info = _pa.get_default_input_device_info()
+    else:
+        device_info = _pa.get_device_info_by_index(MIC_DEVICE_INDEX)
+
+    if device_info.get("maxInputChannels", 0) < INPUT_CHANNELS:
+        raise RuntimeError(
+            f"Selected input device {device_info['index']} "
+            f"({device_info['name']!r}) does not support {INPUT_CHANNELS} "
+            f"input channel(s) — it reports maxInputChannels="
+            f"{device_info.get('maxInputChannels', 0)}. This is likely a "
+            f"stale MIC_DEVICE_INDEX or a non-microphone device (e.g. a "
+            f"downmix/plugin entry). Run audio_io as __main__ or a small "
+            f"script listing pyaudio devices to pick a valid one."
+        )
+
+    log.info(
+        "Resolved microphone: index=%s name=%r maxInputChannels=%s",
+        device_info["index"], device_info["name"], device_info["maxInputChannels"],
+    )
+
     _mic_stream = _pa.open(
         rate=INPUT_SAMPLE_RATE,
         channels=INPUT_CHANNELS,
         format=pyaudio.paInt16,
         input=True,
-        input_device_index=MIC_DEVICE_INDEX,
+        input_device_index=device_info["index"],
         frames_per_buffer=OWW_FRAME_SAMPLES,
     )
     _output_lock = asyncio.Lock()
