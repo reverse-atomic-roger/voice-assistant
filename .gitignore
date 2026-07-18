@@ -44,6 +44,7 @@ wakeword/__pycache__
 wakeword/*.pyc
 wakeword/*.pyo
 wakeword/*.wav
+wakeword/requirements-core.txt
 ollama-stub/.venv
 ollama-stub/.vscode
 ollama-stub/__pycache__

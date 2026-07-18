@@ -55,7 +55,7 @@ import pyaudio
 # ---------------------------------------------------------------------------
 
 # CONFIGURE: PyAudio input device index (run `python -m sounddevice` to list)
-MIC_DEVICE_INDEX = 1
+MIC_DEVICE_INDEX = 17
 
 # CONFIGURE: PyAudio output device index. None = system default output.
 OUTPUT_DEVICE_INDEX = None
