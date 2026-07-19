@@ -25,7 +25,6 @@ import sys
 import wave
 
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
-from wyoming.asr import Transcribe, Transcript
 from wyoming.event import Event, async_read_event, async_write_event
 
 from faster_whisper import WhisperModel
@@ -173,12 +172,17 @@ async def handle_connection(
                 except OSError as exc:
                     log.error("Failed to forward transcript to orchestrator: %s", exc)
 
-                # Send the Transcript event back so the Wyoming protocol
-                # handshake is complete (useful for future chaining).
-                await async_write_event(
-                    Transcript(text=transcript[0]).event(),
-                    writer,
-                )
+                # No response is written back to the satellite here. Its
+                # side of this connection (wakeword_stream.py) sends
+                # AudioStart -> AudioChunk* -> AudioStop and closes
+                # immediately after — it never reads a reply on this
+                # socket. The actual reply to the user (acknowledgement,
+                # TTS, etc.) is delivered separately, by the orchestrator
+                # pushing audio to the satellite's own Wyoming server on
+                # a different connection/port. Writing a Transcript event
+                # back here used to race the satellite's close and
+                # surface as a spurious "dropped unexpectedly" warning
+                # below on the next read.
 
     except (ConnectionResetError, asyncio.IncompleteReadError):
         log.warning("Connection from %s dropped unexpectedly", peer)

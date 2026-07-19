@@ -13,6 +13,7 @@ packaging==26.2
 protobuf==7.35.1
 PyAudio==0.2.14
 pycparser==3.0
+python-mpd2==3.1.1
 requests==2.34.2
 scikit-learn==1.9.0
 scipy==1.18.0

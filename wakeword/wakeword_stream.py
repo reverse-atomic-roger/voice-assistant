@@ -16,10 +16,15 @@ Mic capture and earcon playback go through audio_io, which owns the single
 PyAudio instance shared with audio_receiver.py (so the two never fight over
 the same ALSA device, and playback from either source is serialised).
 
+While the mic is open (wake-word capture or a prompted follow-up), mpd's
+volume is ducked to mpd_control.DUCK_VOLUME via mpd_control.ducking() so
+music playing on the satellite doesn't drown out the user or get picked up
+in the transcript, then restored once capture ends.
+
 Clean sounds downloaded from https://www.stdimension.org/MediaLib/computere.htm
 
 Dependencies:
-    pip install openwakeword wyoming py-silero-vad-lite soundfile
+    pip install openwakeword wyoming py-silero-vad-lite soundfile python-mpd2
 """
 
 import asyncio
@@ -41,6 +46,7 @@ from wyoming.client import AsyncClient
 import soundfile as sf
 
 import audio_io
+import mpd_control
 
 # ---------------------------------------------------------------------------
 # Configuration — tweak these to suit your environment
@@ -283,9 +289,9 @@ async def run() -> None:
             # Use the start earcon so the user knows the mic is open.
             # (Same sound as wake word activation — consistent UX.)
             start_pcm, start_rate = _START_SOUND
-            await audio_io.play_pcm(start_pcm, start_rate, width=4, channels=1)
-
-            await _capture_and_stream(vad, silence_frames_needed, max_capture_frames, VAD_CHUNK_BYTES)
+            async with mpd_control.ducking():
+                await audio_io.play_pcm(start_pcm, start_rate, width=4, channels=1)
+                await _capture_and_stream(vad, silence_frames_needed, max_capture_frames, VAD_CHUNK_BYTES)
 
             last_detection_time = time.monotonic()
             log.info("Prompted capture sent. Resuming wake word detection...")
@@ -323,9 +329,9 @@ async def run() -> None:
         log.info("Wake word detected (score=%.3f) — capturing...", score)
 
         start_pcm, start_rate = _START_SOUND
-        await audio_io.play_pcm(start_pcm, start_rate, width=4, channels=1)
-
-        await _capture_and_stream(vad, silence_frames_needed, max_capture_frames, VAD_CHUNK_BYTES)
+        async with mpd_control.ducking():
+            await audio_io.play_pcm(start_pcm, start_rate, width=4, channels=1)
+            await _capture_and_stream(vad, silence_frames_needed, max_capture_frames, VAD_CHUNK_BYTES)
 
         last_detection_time = time.monotonic()  # reset after streaming completes, otherwise oww just reads the next frame and triggers again
         log.info("Stream sent. Listening again...")
