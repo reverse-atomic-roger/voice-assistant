@@ -14,6 +14,10 @@ Will carry synthesised TTS audio once the TTS service is wired up — no
 change needed here, since this server only cares about the Wyoming audio
 events, not where the PCM originated.
 
+mpd's volume is ducked via mpd_control.ducking() for the duration of
+playback, so a clip arriving mid-song (timer done, etc.) isn't drowned out,
+then restored once playback finishes.
+
 Wyoming event flow (inbound):
     listen_after  — optional; if present before AudioStart, the satellite
                     will open a capture window immediately after playback
@@ -23,7 +27,7 @@ Wyoming event flow (inbound):
     AudioStop     — signals end of clip; playback finishes here
 
 Dependencies:
-    pip install wyoming
+    pip install wyoming python-mpd2
 """
 
 import asyncio
@@ -33,6 +37,7 @@ from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import async_read_event
 
 import audio_io
+import mpd_control
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -59,7 +64,9 @@ async def handle_connection(
 
     Accumulates PCM chunks declared by AudioStart, then plays the full
     clip via audio_io on AudioStop. audio_io.play_pcm() serialises against
-    the wakeword earcons internally, so no locking is needed here.
+    the wakeword earcons internally, so no locking is needed here. Playback
+    is wrapped in mpd_control.ducking() so mpd's volume is lowered for the
+    duration if it's currently above DUCK_VOLUME, then restored.
 
     If the orchestrator sends a listen_after event before AudioStart, the
     audio_io.listen_after event is set after playback completes. wakeword_stream
@@ -101,7 +108,8 @@ async def handle_connection(
                     log.warning("AudioStop from %s with no preceding AudioStart — discarding", peer)
                     continue
 
-                await audio_io.play_pcm(bytes(audio_buffer), rate, width, channels)
+                async with mpd_control.ducking():
+                    await audio_io.play_pcm(bytes(audio_buffer), rate, width, channels)
                 log.info("Played %d bytes of audio from %s", len(audio_buffer), peer)
 
                 # Signal wakeword_stream to capture a reply without a wake word.
