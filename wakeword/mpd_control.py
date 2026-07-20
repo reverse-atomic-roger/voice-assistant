@@ -7,10 +7,11 @@ a wake-word capture window, or while playing an audio clip pushed from the
 server (timer done, command acknowledged, etc.) — and restores it
 afterwards.
 
-Uses python-mpd2, a synchronous client, via asyncio.to_thread(). mpd's
-control protocol is a trivial, low-frequency exchange (a status query and a
-setvol), so a blocking client run off the event loop is simpler than an
-async one and has no real downside here.
+Uses python-mpd2, a synchronous client, via asyncio.to_thread(). Each
+duck/restore is a short ramp (FADE_SECONDS, in FADE_STEPS increments) over
+a single mpd connection held open for the ramp's duration, rather than an
+instant jump — an abrupt volume cut/return sounds jarring, a short fade
+doesn't.
 
 Concurrency model:
     duck() / unduck() are reference-counted rather than a simple flag,
@@ -32,6 +33,7 @@ Dependencies:
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 
 from mpd import MPDClient
@@ -49,6 +51,19 @@ MPD_PORT = 6600
 # CONFIGURE: volume (0-100) to duck down to. Only ducks if mpd's current
 # volume is currently above this.
 DUCK_VOLUME = 10
+
+# CONFIGURE: master switch. Set to False to make duck()/unduck() complete
+# no-ops without touching any call sites — e.g. while mpd's mixer/output
+# config is being fixed after it disconnected PipeWire mid-setvol().
+# Flip back to True once mixer_type "software" (or equivalent) is
+# confirmed stable on the audio_output in mpd.conf.
+DUCKING_ENABLED = True
+
+# CONFIGURE: fade duration for each transition (duck down, and restore
+# back up), and how many intermediate setvol steps to spread it over.
+# 12 steps over 0.25s is ~20ms per step — smooth without spamming mpd.
+FADE_SECONDS = 0.25
+FADE_STEPS = 12
 
 # ---------------------------------------------------------------------------
 
@@ -97,11 +112,25 @@ def _get_volume() -> int:
             pass
 
 
-def _set_volume(vol: int) -> None:
-    """Blocking: set mpd's volume (0-100)."""
+def _fade_volume(start: int, end: int) -> None:
+    """
+    Blocking: ramp mpd's volume from `start` to `end` over FADE_SECONDS,
+    in FADE_STEPS linear steps, all on a single mpd connection (rather
+    than reconnecting per step, which would add latency and network
+    round-trips to every step of the fade).
+    """
+    if start == end:
+        return
+
     client = _connect()
     try:
-        client.setvol(vol)
+        step_delay = FADE_SECONDS / FADE_STEPS
+        for i in range(1, FADE_STEPS + 1):
+            vol = round(start + (end - start) * i / FADE_STEPS)
+            vol = max(0, min(100, vol))
+            client.setvol(vol)
+            if i < FADE_STEPS:
+                time.sleep(step_delay)
     finally:
         try:
             client.close()
@@ -128,12 +157,15 @@ async def duck() -> None:
     """
     global _duck_count, _pre_duck_volume
 
+    if not DUCKING_ENABLED:
+        return
+
     async with _duck_lock:
         if _duck_count == 0:
             try:
                 current = await asyncio.to_thread(_get_volume)
                 if current > DUCK_VOLUME:
-                    await asyncio.to_thread(_set_volume, DUCK_VOLUME)
+                    await asyncio.to_thread(_fade_volume, current, DUCK_VOLUME)
                     _pre_duck_volume = current
                     log.info("Ducked mpd volume %d -> %d", current, DUCK_VOLUME)
                 else:
@@ -154,6 +186,9 @@ async def unduck() -> None:
     """
     global _duck_count, _pre_duck_volume
 
+    if not DUCKING_ENABLED:
+        return
+
     async with _duck_lock:
         if _duck_count == 0:
             log.warning("unduck() called with no matching duck() — ignoring")
@@ -162,7 +197,7 @@ async def unduck() -> None:
         _duck_count -= 1
         if _duck_count == 0 and _pre_duck_volume is not None:
             try:
-                await asyncio.to_thread(_set_volume, _pre_duck_volume)
+                await asyncio.to_thread(_fade_volume, DUCK_VOLUME, _pre_duck_volume)
                 log.info("Restored mpd volume to %d", _pre_duck_volume)
             except Exception as exc:
                 log.warning(
