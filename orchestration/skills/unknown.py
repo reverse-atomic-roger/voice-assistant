@@ -10,6 +10,9 @@ response should always stay with whoever spoke, never get broadcast to a
 room they may have named for a *different* part of the (misunderstood)
 request. See voice-assistant-refactor-2026-07-02.md, Part 2, "Why this
 design, and not something else" for the reasoning.
+
+Also takes user_id (per the standard Skill handler signature) but doesn't
+use it — who spoke doesn't change what "I didn't understand that" means.
 """
 
 import logging
@@ -25,7 +28,7 @@ PROMPT_BLOCK = """\
 """
 
 
-async def handle(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
+async def handle(slots: dict, satellite_ip: str, target_satellites: list[str], user_id: str) -> str | None:
     log.info("Unknown intent — sending canned response")
     await audio_io.send_canned("unknown", satellite_ip)
     return None  # canned audio already sent, no TTS needed

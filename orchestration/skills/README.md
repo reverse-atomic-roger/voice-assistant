@@ -20,7 +20,7 @@ PROMPT_BLOCK = """\
     song_title  (string) the song the user wants to play
 """
 
-async def handle(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
+async def handle(slots: dict, satellite_ip: str, target_satellites: list[str], user_id: str) -> str | None:
     song = slots.get("song_title", "").strip()
     if not song:
         raise ClarificationNeeded(
@@ -65,7 +65,7 @@ That's the whole interface. Five pieces:
   intent-specific instruction paragraph). Fold any formatting rules
   specific to your intent into this block — don't assume anything outside
   your skill's own file.
-- **`handler`** — `async def (slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None`.
+- **`handler`** — `async def (slots: dict, satellite_ip: str, target_satellites: list[str], user_id: str) -> str | None`.
   Return a string to be spoken back to the user, or `None` if you already
   handled the audio yourself. Raise `ClarificationNeeded` for any required
   slot that's missing — the orchestrator will ask the question for you and
@@ -80,6 +80,15 @@ That's the whole interface. Five pieces:
   every target for you. Only reach for it directly if your skill needs
   the destination for something else, like passing it through to
   `database.add_trigger(...)` the way `skills/timer.py` does.
+  `user_id` is the speaker identified by the STT server's speaker-ID step
+  (`"unknown"` if unidentified, or below its confidence threshold). Every
+  handler must accept it, even if it never looks at the value — the
+  registry checks your handler's parameter count at import time and fails
+  loudly if it doesn't match, the same way it fails on a duplicate intent
+  name. Most skills can ignore it entirely, same as `target_satellites`;
+  only use it if behaviour or persisted data should genuinely vary by who's
+  asking (`skills/timer.py` does this — a timer remembers who set it, and
+  its completion announcement uses that name when known).
 - **`router_hint`** — one plain-English sentence describing what the
   intent is for, e.g. `"Play a song, artist, album, or mood/vibe
   description."` Used by `intent_router.py` to decide which skills'
@@ -116,8 +125,9 @@ skill (play, pause, skip, queue, playlist) is exactly as much work to
 register as a one-intent skill like timer.
 
 The registry validates itself at import time — a duplicate intent name, a
-missing handler, an empty prompt block, or a module in `SKILL_MODULES`
-that forgot to define `SKILLS` will all fail loudly at startup rather than
+missing handler, a handler (or `TRIGGER.on_trigger`) with the wrong number
+of parameters, an empty prompt block, or a module in `SKILL_MODULES` that
+forgot to define `SKILLS` will all fail loudly at startup rather than
 misbehaving mid-conversation.
 
 ## What you get for free
@@ -133,6 +143,11 @@ misbehaving mid-conversation.
   text; the orchestrator delivers it everywhere it needs to go. See
   `target_satellites` in "The contract" above if your skill needs to know
   the destination itself.
+- Speaker identification — the STT server resolves the speaker against
+  enrolled voice profiles before your handler ever runs, and the result
+  arrives as `user_id` (`"unknown"` if unidentified or below its confidence
+  threshold). No skill needs to do its own speaker matching; just read
+  `user_id` if your skill's behaviour should vary by who's asking.
 - Slot names only need to be unique *within your skill* — the registry
   keys everything by `(intent, slot)`, so two skills can both have a
   `name` slot without colliding.
@@ -192,7 +207,7 @@ Two calls:
 import database
 from skills.base import Skill, TriggerHandler
 
-async def handle(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
+async def handle(slots: dict, satellite_ip: str, target_satellites: list[str], user_id: str) -> str | None:
     # ... figure out when this should fire and what to remember ...
     database.add_trigger(
         skill="play_music",              # matches TRIGGER.skill_name below
@@ -201,10 +216,11 @@ async def handle(slots: dict, satellite_ip: str, target_satellites: list[str]) -
         origin_satellite_ip=satellite_ip,      # who asked, for error reporting
         target_satellites=target_satellites,   # where the announcement plays
         payload={"song": song},          # whatever your on_trigger callback needs
+        user_id=user_id,                 # who asked, for ownership/personalisation
     )
     return "Got it, I'll let you know."
 
-async def _on_fire(payload: dict) -> str | None:
+async def _on_fire(payload: dict, user_id: str) -> str | None:
     return f"{payload['song']} finished."
 
 TRIGGER = TriggerHandler(skill_name="play_music", on_trigger=_on_fire)
@@ -229,6 +245,12 @@ A few things worth knowing about how this works:
   delivery fails (`origin_satellite_ip`) and where to actually play the
   announcement (`target_satellites`), without `on_trigger` needing to
   decide either one again.
+- **Ownership is stored the same way.** `add_trigger`'s `user_id` argument
+  works exactly like `origin_satellite_ip` — pass through the `user_id`
+  your `handle()` was called with, and it comes back to `on_trigger` when
+  the trigger fires (`"unknown"` if the speaker wasn't identified). Use it
+  if your announcement should address a specific person by name; ignore it
+  if your skill has no concept of ownership.
 - **`on_trigger` returns text or `None`.** Return the string to speak, or
   `None` if your skill already handled its own audio output and there's
   nothing more to say.

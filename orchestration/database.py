@@ -20,6 +20,14 @@ get real columns:
     announcement plays, because a skill may still need it later (e.g. an
     error notification, or an intercom-style skill wanting to reply to
     whoever spoke).
+  - `user_id`              — who scheduled this trigger, identified by the
+    STT server's speaker-ID step ("unknown" if unidentified). Same
+    reasoning as origin_satellite_ip: ownership of a timer/reminder/etc. is
+    a cross-skill concern, not something any one skill's payload should
+    reinvent — and it's a precondition for any future per-person routing
+    (e.g. announcing to whichever satellite the owner is actually near,
+    once location tracking exists) rather than always broadcasting to
+    target_satellites.
   - `target_satellites`    — where the resulting announcement should
     actually be delivered when the trigger fires (usually just the origin,
     but "set a timer in the kitchen" targets the kitchen instead). Routing
@@ -100,6 +108,7 @@ CREATE TABLE IF NOT EXISTS triggers (
     trigger_key        TEXT    NOT NULL,                -- skill-local key, not interpreted by the core (lets a skill find/cancel its own trigger later)
     fires_at           TEXT    NOT NULL,                -- UTC ISO 8601
     origin_satellite_ip TEXT   NOT NULL,                -- satellite that made the original request
+    user_id            TEXT    NOT NULL DEFAULT 'unknown', -- speaker who scheduled this trigger, from STT speaker-ID
     target_satellites  TEXT    NOT NULL DEFAULT '[]',   -- JSON array of IPs to announce to when this fires
     payload            TEXT    NOT NULL DEFAULT '{}',   -- opaque JSON owned by the skill
     fired              INTEGER NOT NULL DEFAULT 0
@@ -109,6 +118,25 @@ CREATE TABLE IF NOT EXISTS triggers (
 CREATE INDEX IF NOT EXISTS idx_triggers_fires_at ON triggers (fires_at)
     WHERE fired = 0;
 """
+
+
+def _migrate_add_user_id_column(conn: sqlite3.Connection) -> None:
+    """
+    Add triggers.user_id to a database created before this column existed.
+
+    CREATE TABLE IF NOT EXISTS in _CORE_SCHEMA only helps on a fresh
+    database — it's a no-op against a triggers table that already exists on
+    disk without this column. ALTER TABLE ADD COLUMN with a DEFAULT is safe
+    and cheap even on a populated table, so we just check for the column
+    and add it if missing, rather than versioning the whole schema.
+    """
+    existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(triggers)")}
+    if "user_id" not in existing_columns:
+        log.info("Migrating triggers table: adding user_id column")
+        conn.execute(
+            "ALTER TABLE triggers ADD COLUMN user_id TEXT NOT NULL DEFAULT 'unknown'"
+        )
+        conn.commit()
 
 
 def register_schema(sql: str) -> None:
@@ -167,6 +195,7 @@ def init() -> None:
     conn.execute("PRAGMA foreign_keys=ON")
 
     conn.executescript(_CORE_SCHEMA)
+    _migrate_add_user_id_column(conn)
     for schema in _pending_schemas:
         conn.executescript(schema)
     conn.commit()
@@ -234,6 +263,7 @@ class Trigger:
     trigger_key: str
     fires_at: datetime
     origin_satellite_ip: str
+    user_id: str
     target_satellites: list[str]
     payload: dict
 
@@ -245,6 +275,7 @@ def add_trigger(
     origin_satellite_ip: str,
     target_satellites: list[str] | None = None,
     payload: dict | None = None,
+    user_id: str = "unknown",
 ) -> int:
     """
     Schedule a future event and return its row id.
@@ -274,6 +305,18 @@ def add_trigger(
     payload              — arbitrary JSON-serialisable dict owned entirely by
                            the skill. Stored and returned verbatim; the core
                            never reads or interprets its contents.
+    user_id              — speaker who scheduled this trigger, from the STT
+                           server's speaker-ID step. "unknown" if
+                           unidentified or below its confidence threshold.
+                           Stored as a real column (not payload) for the
+                           same reason as origin_satellite_ip: ownership is
+                           a cross-skill concern, and future features (e.g.
+                           routing an announcement to wherever the owner
+                           currently is) need to query on it without every
+                           skill agreeing on a payload key first.
+                           Placed last, after the existing parameters, so
+                           existing positional call sites in skills keep
+                           working unchanged until you update them.
     """
     fires_at_str = fires_at.astimezone(timezone.utc).isoformat()
     resolved_targets = list(target_satellites) if target_satellites else [origin_satellite_ip]
@@ -281,14 +324,14 @@ def add_trigger(
     payload_str = json.dumps(payload or {})
     cur = _db().execute(
         "INSERT INTO triggers "
-        "(skill, trigger_key, fires_at, origin_satellite_ip, target_satellites, payload, fired) "
-        "VALUES (?, ?, ?, ?, ?, ?, 0)",
-        (skill, trigger_key, fires_at_str, origin_satellite_ip, targets_str, payload_str),
+        "(skill, trigger_key, fires_at, origin_satellite_ip, target_satellites, payload, user_id, fired) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+        (skill, trigger_key, fires_at_str, origin_satellite_ip, targets_str, payload_str, user_id),
     )
     _db().commit()
     log.debug(
-        "Trigger added: id=%d skill=%r trigger_key=%r fires_at=%s origin=%s targets=%s",
-        cur.lastrowid, skill, trigger_key, fires_at_str, origin_satellite_ip, resolved_targets,
+        "Trigger added: id=%d skill=%r trigger_key=%r fires_at=%s origin=%s user=%r targets=%s",
+        cur.lastrowid, skill, trigger_key, fires_at_str, origin_satellite_ip, user_id, resolved_targets,
     )
     return cur.lastrowid
 
@@ -323,6 +366,7 @@ def _trigger_from_row(row: sqlite3.Row) -> Trigger:
         trigger_key=row["trigger_key"],
         fires_at=datetime.fromisoformat(row["fires_at"]),
         origin_satellite_ip=row["origin_satellite_ip"],
+        user_id=row["user_id"],
         target_satellites=target_satellites,
         payload=payload,
     )
@@ -340,7 +384,7 @@ def get_due_triggers(now: datetime) -> list[Trigger]:
     """
     now_str = now.astimezone(timezone.utc).isoformat()
     rows = _db().execute(
-        "SELECT id, skill, trigger_key, fires_at, origin_satellite_ip, target_satellites, payload "
+        "SELECT id, skill, trigger_key, fires_at, origin_satellite_ip, user_id, target_satellites, payload "
         "FROM triggers WHERE fired = 0 AND fires_at <= ?",
         (now_str,),
     ).fetchall()
@@ -357,7 +401,7 @@ def get_pending_triggers(skill: str) -> list[Trigger]:
     Ordered by fires_at ascending, so the soonest-to-fire trigger is first.
     """
     rows = _db().execute(
-        "SELECT id, skill, trigger_key, fires_at, origin_satellite_ip, target_satellites, payload "
+        "SELECT id, skill, trigger_key, fires_at, origin_satellite_ip, user_id, target_satellites, payload "
         "FROM triggers WHERE fired = 0 AND skill = ? ORDER BY fires_at ASC",
         (skill,),
     ).fetchall()

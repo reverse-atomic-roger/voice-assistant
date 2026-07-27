@@ -416,7 +416,9 @@ def _merge_slot_from_fill(
 HANDLERS: dict[str, Callable] = {skill.intent: skill.handler for skill in REGISTERED_SKILLS}
 
 
-async def dispatch(intent: dict, satellite_ip: str, target_satellites: list[str]) -> None:
+async def dispatch(
+    intent: dict, satellite_ip: str, target_satellites: list[str], user_id: str,
+) -> None:
     """
     Fire the acknowledgement earcon, then route to the correct skill handler.
 
@@ -434,10 +436,20 @@ async def dispatch(intent: dict, satellite_ip: str, target_satellites: list[str]
     does no name lookup, so a clarification follow-up can pass the same
     list it captured on the first turn without re-resolving anything.
 
+    user_id is the speaker identified by the STT server's speaker-ID step
+    ("unknown" if unidentified or below its confidence threshold). It is
+    passed straight through as the handler's fourth positional parameter —
+    every registered handler must accept it (skills/registry.py checks this
+    at import time) — rather than being folded into slots or looked up via
+    signature inspection on every call. Most skills ignore the value
+    entirely, the same way most ignore target_satellites; a skill only
+    needs to read it if behaviour or persisted data should vary by who's
+    asking (e.g. "play my playlist").
+
     If the handler raises ClarificationNeeded, the question is spoken to the
-    user and the context (including target_satellites) is stored so the next
-    utterance can fill the missing slot without repeating intent extraction
-    or losing the originally-named room.
+    user and the context (including target_satellites and user_id) is stored
+    so the next utterance can fill the missing slot without repeating intent
+    extraction or losing who originally asked.
     """
     intent_name = intent.get("intent", "unknown")
     slots = intent.get("slots", {})
@@ -445,8 +457,8 @@ async def dispatch(intent: dict, satellite_ip: str, target_satellites: list[str]
 
     satellite_name = satellite_name_from_ip(satellite_ip) or satellite_ip
     log.info(
-        "Dispatching intent=%r slots=%s from %s -> targets=%s",
-        intent_name, slots, satellite_name, target_satellites,
+        "Dispatching intent=%r slots=%s from %s (user=%r) -> targets=%s",
+        intent_name, slots, satellite_name, user_id, target_satellites,
     )
 
     # Fire acknowledgement immediately for known intents — runs concurrently
@@ -463,7 +475,7 @@ async def dispatch(intent: dict, satellite_ip: str, target_satellites: list[str]
         ack_task = None
 
     try:
-        response_text = await handler(slots, satellite_ip, target_satellites)
+        response_text = await handler(slots, satellite_ip, target_satellites, user_id)
     except ClarificationNeeded as clarification:
         # Handler needs more information. Store context, speak the question.
         log.info(
@@ -476,6 +488,7 @@ async def dispatch(intent: dict, satellite_ip: str, target_satellites: list[str]
             missing_slot=clarification.missing_slot,
             question=clarification.question,
             target_satellites=target_satellites,
+            user_id=user_id,
         )
         conversation_state.set(satellite_ip, ctx)
 
@@ -565,9 +578,9 @@ async def trigger_poller() -> None:
 
         for trigger in due:
             log.info(
-                "Trigger fired: id=%d skill=%r trigger_key=%r origin=%s targets=%s",
+                "Trigger fired: id=%d skill=%r trigger_key=%r origin=%s user=%r targets=%s",
                 trigger.id, trigger.skill, trigger.trigger_key,
-                trigger.origin_satellite_ip, trigger.target_satellites,
+                trigger.origin_satellite_ip, trigger.user_id, trigger.target_satellites,
             )
 
             # Mark fired immediately — if the handler or TTS fails below, we
@@ -589,7 +602,7 @@ async def trigger_poller() -> None:
                 continue
 
             try:
-                announcement = await handler.on_trigger(trigger.payload)
+                announcement = await handler.on_trigger(trigger.payload, trigger.user_id)
             except Exception:
                 log.exception(
                     "TriggerHandler for skill=%r raised on trigger id=%d — announcement lost",
@@ -710,7 +723,16 @@ async def handle_connection(
         log.debug("satellite IP extracted, %s", satellite_ip)
         satellite_name = satellite_name_from_ip(satellite_ip) or satellite_ip
 
-        log.info("Transcript from %s: %r", satellite_name, text)
+        # user_id/user_confidence come from the STT server's speaker-ID step.
+        # Default to "unknown"/0.0 rather than KeyError so this still works
+        # against an STT server that hasn't been upgraded to send them yet.
+        user_id = event.data.get("user_id", "unknown")
+        user_confidence = event.data.get("user_confidence", 0.0)
+
+        log.info(
+            "Transcript from %s (user=%r, confidence=%.3f): %r",
+            satellite_name, user_id, user_confidence, text,
+        )
 
         if not text:
             log.warning("Empty transcript from %s — nothing to do", satellite_name)
@@ -722,9 +744,17 @@ async def handle_connection(
         if ctx is not None:
             # We are mid-clarification. Try to fill the missing slot from this reply.
             log.info(
-                "Clarification reply from %s (intent=%r missing_slot=%r turn=%d): %r",
-                satellite_name, ctx.intent, ctx.missing_slot, ctx.turn, text,
+                "Clarification reply from %s (intent=%r missing_slot=%r turn=%d, "
+                "owner=%r): %r",
+                satellite_name, ctx.intent, ctx.missing_slot, ctx.turn, ctx.user_id, text,
             )
+            if ctx.user_id != user_id:
+                log.debug(
+                    "Clarification answered by a different speaker (%r) than the "
+                    "one who asked (%r) — action still belongs to %r",
+                    user_id, ctx.user_id, ctx.user_id,
+                )
+            
             conversation_state.increment_turn(satellite_ip)
 
             try:
@@ -757,7 +787,7 @@ async def handle_connection(
             # Slot filled successfully. Clear context and re-dispatch with completed slots.
             conversation_state.clear(satellite_ip)
             intent = {"intent": ctx.intent, "slots": updated_slots}
-            await dispatch(intent, satellite_ip, ctx.target_satellites)
+            await dispatch(intent, satellite_ip, ctx.target_satellites, ctx.user_id)
             return
 
         # No pending clarification — normal intent extraction path.
@@ -765,7 +795,7 @@ async def handle_connection(
         target_satellites = _resolve_target_satellites(
             intent.get("target_satellites", []), satellite_ip,
         )
-        await dispatch(intent, satellite_ip, target_satellites)
+        await dispatch(intent, satellite_ip, target_satellites, user_id)
 
     except (ConnectionResetError, asyncio.IncompleteReadError):
         log.warning("Connection from %s dropped unexpectedly", peer)

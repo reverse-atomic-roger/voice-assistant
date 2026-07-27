@@ -33,6 +33,7 @@ it finds; a skill with no TRIGGER attribute is simply skipped, so most
 skills never need to think about this at all.
 """
 
+import inspect
 import logging
 
 from skills import lists, timer, music, unknown
@@ -95,6 +96,19 @@ def _validate(skills: list[Skill]) -> None:
         if not callable(skill.handler):
             raise RuntimeError(f"Skill {skill.intent!r} has a non-callable handler")
 
+        # Every handler must accept exactly (slots, satellite_ip,
+        # target_satellites, user_id) — checked once here, at import time,
+        # rather than on every dispatch() call, so a skill author who
+        # forgets to add the user_id parameter gets a loud failure at
+        # startup instead of a silent TypeError mid-conversation.
+        handler_params = inspect.signature(skill.handler).parameters
+        if len(handler_params) != 4:
+            raise RuntimeError(
+                f"Skill {skill.intent!r} handler must accept exactly 4 parameters "
+                f"(slots, satellite_ip, target_satellites, user_id), got "
+                f"{len(handler_params)}: {list(handler_params)}"
+            )
+
         if not skill.prompt_block.strip():
             raise RuntimeError(f"Skill {skill.intent!r} has an empty prompt_block")
 
@@ -142,6 +156,15 @@ def _collect_trigger_handlers(modules: list) -> dict[str, TriggerHandler]:
         if not callable(trigger.on_trigger):
             raise RuntimeError(
                 f"{module.__name__}.TRIGGER has a non-callable on_trigger"
+            )
+
+        # Same one-time arity check as handler above — (payload, user_id).
+        trigger_params = inspect.signature(trigger.on_trigger).parameters
+        if len(trigger_params) != 2:
+            raise RuntimeError(
+                f"{module.__name__}.TRIGGER.on_trigger must accept exactly 2 "
+                f"parameters (payload, user_id), got {len(trigger_params)}: "
+                f"{list(trigger_params)}"
             )
 
         handlers[trigger.skill_name] = trigger

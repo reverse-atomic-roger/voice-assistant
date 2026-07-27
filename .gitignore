@@ -29,6 +29,7 @@ stt/.vscode
 stt/__pycache__/
 stt/*.pyc
 stt/*.pyo
+stt/*.json
 tts/.venv
 tts/.vscode
 tts/*.onnx

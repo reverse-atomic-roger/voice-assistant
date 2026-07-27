@@ -68,7 +68,7 @@ class Skill:
                   rule elsewhere, since this block is the only thing that
                   travels with the skill.
     handler:      async def (slots: dict, satellite_ip: str,
-                  target_satellites: list[str]) -> str | None.
+                  target_satellites: list[str], user_id: str) -> str | None.
                   Return a string to be spoken via TTS, or None if the
                   skill already handled all the audio output itself.
                   Raise ClarificationNeeded for a missing required slot —
@@ -90,6 +90,17 @@ class Skill:
                   yourself if your skill needs the destination for some
                   other reason (e.g. storing it in a trigger payload, the
                   way skills/timer.py does).
+
+                  user_id is the speaker identified by the STT server's
+                  speaker-ID step ("unknown" if unidentified or below its
+                  confidence threshold). Every handler must accept it —
+                  skills/registry.py checks this at import time and fails
+                  loudly if a handler's signature doesn't match — but most
+                  skills can ignore the value entirely, the same way most
+                  ignore target_satellites. Only use it if your skill's
+                  behaviour or persisted data should vary by who's asking
+                  (e.g. "play my playlist", or a reminder that should be
+                  attributed to whoever set it).
     slot_specs:   slot name -> SlotSpec, for any slot this skill might ask
                   the user to clarify. Keyed by plain slot name here — the
                   registry namespaces it to (intent, slot) automatically,
@@ -114,7 +125,7 @@ class Skill:
     """
     intent: str
     prompt_block: str
-    handler: Callable[[dict, str, list[str]], Awaitable[str | None]]
+    handler: Callable[[dict, str, list[str], str], Awaitable[str | None]]
     slot_specs: dict[str, SlotSpec] = field(default_factory=dict)
     router_hint: str = ""
 
@@ -135,19 +146,26 @@ class TriggerHandler:
                 `database.add_trigger(...)` when the event was scheduled.
                 Checked for uniqueness across all registered skills by
                 skills/registry.py, the same way `Skill.intent` is.
-    on_trigger: async def (payload: dict) -> str | None. `payload` is
-                exactly the dict the skill originally stored — the core
-                never inspects or modifies it, so put whatever the skill
-                needs to compose its announcement in there (e.g. a label).
+    on_trigger: async def (payload: dict, user_id: str) -> str | None.
+                `payload` is exactly the dict the skill originally stored
+                — the core never inspects or modifies it, so put whatever
+                the skill needs to compose its announcement in there (e.g.
+                a label). `user_id` is whoever scheduled the trigger
+                (database.add_trigger's user_id, "unknown" if none was
+                given) — most skills can ignore it, same as target_satellites
+                on a regular handler, but it's there for anything that
+                should address the announcement to a specific person (e.g.
+                "Bob's pasta timer is done" instead of just "Pasta timer
+                is done").
                 Return the text to speak, or None if the skill doesn't want
                 anything said (e.g. it already did its own audio I/O).
                 The poller already knows *where* to send that text — it
-                comes from the trigger's `satellite_ip`, set once at
+                comes from the trigger's `target_satellites`, set once at
                 scheduling time — so on_trigger only needs to decide *what*
                 to say.
     """
     skill_name: str
-    on_trigger: Callable[[dict], Awaitable[str | None]]
+    on_trigger: Callable[[dict, str], Awaitable[str | None]]
 
 
 # ---------------------------------------------------------------------------

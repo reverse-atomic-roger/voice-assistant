@@ -91,7 +91,7 @@ def _format_duration(duration_seconds: int) -> str:
     return ", ".join(parts) if parts else "0 seconds"
 
 
-async def handle(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
+async def handle(slots: dict, satellite_ip: str, target_satellites: list[str], user_id: str) -> str | None:
     slots = _normalize_duration(slots)
     duration = int(slots.get("duration_seconds", 0) or 0)
 
@@ -125,24 +125,33 @@ async def handle(slots: dict, satellite_ip: str, target_satellites: list[str]) -
         origin_satellite_ip=satellite_ip,
         target_satellites=target_satellites,
         payload={"label": label},
+        user_id=user_id,
     )
 
     log.info(
-        "Timer set: label=%r duration=%ds fires_at=%s origin=%s targets=%s",
-        label, duration, fires_at.isoformat(), satellite_ip, target_satellites,
+        "Timer set: label=%r duration=%ds fires_at=%s origin=%s user=%r targets=%s",
+        label, duration, fires_at.isoformat(), satellite_ip, user_id, target_satellites,
     )
 
     return f"Timer set. {duration_str} remaining."
 
 
-async def _on_timer_trigger(payload: dict) -> str:
+async def _on_timer_trigger(payload: dict, user_id: str) -> str:
     """
     Called by the orchestrator's trigger poller when a timer's trigger row
     comes due. `payload` is exactly what handle() stored above — the core
     never looks inside it, so this is the only place that needs to know a
     timer's payload shape is `{"label": str}`.
+
+    user_id is whoever set the timer (from database.add_trigger's user_id,
+    "unknown" if unidentified). Used to personalise the announcement when
+    known, since a household with several people's timers running at once
+    benefits from knowing whose is whose — falls back to the unlabelled
+    phrasing exactly as before when the speaker wasn't identified.
     """
     label = payload.get("label") or "Timer"
+    if user_id and user_id != "unknown":
+        return f"{user_id.capitalize()}'s {label} timer complete."
     return f"{label.capitalize()} timer complete."
 
 
@@ -158,7 +167,11 @@ PROMPT_BLOCK_CHECK_TIMER = """\
 """
 
 
-async def handle_check_timer(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
+async def handle_check_timer(slots: dict, satellite_ip: str, target_satellites: list[str], user_id: str) -> str | None:
+    # user_id is accepted for signature consistency (see skills/base.py) but
+    # not yet used here — check_timer reports every pending timer regardless
+    # of who set it. Filtering to "your timers" vs "everyone's timers" is a
+    # reasonable follow-up once that distinction actually matters day to day.
     label = slots.get("label", "")
     label = label.strip() if isinstance(label, str) else ""
 

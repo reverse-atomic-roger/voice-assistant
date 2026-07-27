@@ -36,6 +36,17 @@ Dependencies not needed elsewhere in the assistant:
     pip install python-mpd2 sqlite-vec
 music_indexer.py additionally needs librosa + mutagen, but those are NOT
 required just to run the assistant — see that script's docstring.
+
+Every handler below now accepts `user_id` (per the standard Skill handler
+signature) but none of them use it yet — playlists are still shared/
+household-wide, so "play my playlist" resolves the same way regardless of
+who asks. Making playlists genuinely per-person would mean adding an
+owner column to `playlists`, deciding what "my playlist" means when two
+people have separately made one with the same name, and deciding how an
+unidentified speaker's "my" should degrade. That's a real design decision,
+not a signature change, so it's deliberately not done here — this module
+only takes the parameter so its handlers match every other skill's
+signature.
 """
 
 import difflib
@@ -495,7 +506,7 @@ PROMPT_BLOCK_SET_VOLUME = """\
 """
 
 
-async def handle_play_music(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
+async def handle_play_music(slots: dict, satellite_ip: str, target_satellites: list[str], user_id: str) -> str | None:
     query = str(slots.get("query", "") or "").strip()
     artist = str(slots.get("artist", "") or "").strip()
     album = str(slots.get("album", "") or "").strip()
@@ -535,7 +546,7 @@ async def handle_play_music(slots: dict, satellite_ip: str, target_satellites: l
     return f"Playing {label}."
 
 
-async def handle_make_playlist(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
+async def handle_make_playlist(slots: dict, satellite_ip: str, target_satellites: list[str], user_id: str) -> str | None:
     name = str(slots.get("playlist_name", "") or "").strip()
     query = str(slots.get("query", "") or "").strip()
 
@@ -571,7 +582,7 @@ async def handle_make_playlist(slots: dict, satellite_ip: str, target_satellites
     return f"Made a playlist called {name} with {count} track{'s' if count != 1 else ''}."
 
 
-async def handle_play_playlist(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
+async def handle_play_playlist(slots: dict, satellite_ip: str, target_satellites: list[str], user_id: str) -> str | None:
     name = str(slots.get("playlist_name", "") or "").strip()
 
     if not name:
@@ -597,7 +608,7 @@ async def handle_play_playlist(slots: dict, satellite_ip: str, target_satellites
     return f"Playing {name} playlist, {count} track{'s' if count != 1 else ''}."
 
 
-async def handle_pause_music(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
+async def handle_pause_music(slots: dict, satellite_ip: str, target_satellites: list[str], user_id: str) -> str | None:
     try:
         _pause_on_satellites(target_satellites)
     except ConnectionError:
@@ -606,7 +617,7 @@ async def handle_pause_music(slots: dict, satellite_ip: str, target_satellites: 
     return "Paused."
 
 
-async def handle_resume_music(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
+async def handle_resume_music(slots: dict, satellite_ip: str, target_satellites: list[str], user_id: str) -> str | None:
     try:
         _resume_on_satellites(target_satellites)
     except ConnectionError:
@@ -615,7 +626,7 @@ async def handle_resume_music(slots: dict, satellite_ip: str, target_satellites:
     return "Resuming."
 
 
-async def handle_set_volume(slots: dict, satellite_ip: str, target_satellites: list[str]) -> str | None:
+async def handle_set_volume(slots: dict, satellite_ip: str, target_satellites: list[str], user_id: str) -> str | None:
     level = slots.get("level")
     direction = str(slots.get("direction", "") or "").strip().lower()
     amount = slots.get("amount")

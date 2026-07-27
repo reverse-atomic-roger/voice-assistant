@@ -4,25 +4,36 @@ stt_server.py
 
 Wyoming-protocol STT server. Listens for incoming satellite connections,
 receives AudioStart → AudioChunk* → AudioStop, transcribes the audio with
-Faster-Whisper, and logs the transcript.
+Faster-Whisper, identifies the speaker against enrolled voice profiles, and
+logs the transcript.
 
-The transcript is held in a variable after transcription — ready to be passed
-to the orchestration layer once that is wired up.
+The transcript and identified speaker are held in variables after
+processing — ready to be passed to the orchestration layer once that is
+wired up.
 
 Wyoming event flow (inbound):
     AudioStart  — declares sample rate / width / channels
     AudioChunk  — raw PCM bytes (one or many)
-    AudioStop   — signals end of utterance; transcription runs here
+    AudioStop   — signals end of utterance; transcription + speaker ID run here
+
+Voice profiles are produced separately by enroll_speaker.py and loaded from
+VOICE_PROFILES_PATH at startup.
 
 Dependencies:
-    pip install wyoming faster-whisper
+    pip install wyoming faster-whisper speechbrain numpy soundfile
 """
 
 import asyncio
 import io
+import json
 import logging
 import sys
 import wave
+
+import numpy as np
+import soundfile as sf
+import torch
+from speechbrain.inference.speaker import EncoderClassifier
 
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event, async_read_event, async_write_event
@@ -52,6 +63,17 @@ WHISPER_DEVICE = "cpu"
 
 # CONFIGURE: compute type — "int8" is fast and fine for CPU; "float16" for GPU
 WHISPER_COMPUTE_TYPE = "int8"
+
+# CONFIGURE: speaker-ID embedding model (downloaded from HuggingFace on first run)
+SPEAKER_MODEL_SOURCE = "speechbrain/spkrec-ecapa-voxceleb"
+
+# CONFIGURE: path to enrolled voice profiles, produced by enroll_speaker.py
+VOICE_PROFILES_PATH = "voice_profiles.json"
+
+# CONFIGURE: cosine-similarity threshold below which a speaker is "unknown".
+# Tune this against your own household's enrolled data — run enroll_speaker.py's
+# test mode and look at the gap between "self" and "sibling" scores.
+SPEAKER_MATCH_THRESHOLD = 0.55
 
 # ---------------------------------------------------------------------------
 # Fixed audio constants — must match satellite
@@ -83,12 +105,54 @@ def pcm_bytes_to_wav_bytes(pcm: bytes) -> bytes:
         wf.writeframes(pcm)
     return buf.getvalue()
 
-async def forward_transcript(text: str, satellite_ip: str) -> None:
+def load_voice_profiles(path: str) -> dict[str, np.ndarray]:
+    """
+    Load enrolled speaker embeddings written by enroll_speaker.py.
+
+    Raises FileNotFoundError / json.JSONDecodeError on failure — the caller
+    decides whether that's fatal (see __main__).
+    """
+    with open(path) as f:
+        raw = json.load(f)
+    return {name: np.array(vec, dtype=np.float32) for name, vec in raw.items()}
+
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+
+def identify_speaker(
+    embedding: np.ndarray,
+    profiles: dict[str, np.ndarray],
+    threshold: float = SPEAKER_MATCH_THRESHOLD,
+) -> tuple[str, float]:
+    """
+    Compare an utterance embedding against all enrolled profiles.
+
+    Returns (user_id, confidence). user_id is "unknown" if the best match
+    doesn't clear `threshold` — callers must handle that case explicitly
+    rather than assuming a name is always returned.
+    """
+    best_name, best_score = "unknown", -1.0
+    for name, ref in profiles.items():
+        score = cosine_similarity(embedding, ref)
+        if score > best_score:
+            best_name, best_score = name, score
+
+    if best_score < threshold:
+        return "unknown", best_score
+    return best_name, best_score
+
+
+async def forward_transcript(
+    text: str, satellite_ip: str, user_id: str, user_confidence: float
+) -> None:
     """
     Send a Wyoming Transcript event to the orchestration service.
 
-    The satellite's peer IP is carried in the event's data field so the
-    orchestrator knows where to send the TTS response.
+    The satellite's peer IP and the identified speaker are carried in the
+    event's data field so the orchestrator knows where to send the TTS
+    response and whose profile to apply.
     """
     from wyoming.asr import Transcript
     from wyoming.event import Event, async_write_event
@@ -98,7 +162,12 @@ async def forward_transcript(text: str, satellite_ip: str) -> None:
         transcript_event = Transcript(text=text).event()
         event_with_ip = Event(
             type=transcript_event.type,
-            data = {"text":text, "satellite_ip":satellite_ip},
+            data={
+                "text": text,
+                "satellite_ip": satellite_ip,
+                "user_id": user_id,
+                "user_confidence": user_confidence,
+            },
             payload=transcript_event.payload,
         )
         await async_write_event(event_with_ip, writer)
@@ -107,7 +176,10 @@ async def forward_transcript(text: str, satellite_ip: str) -> None:
         writer.close()
         await writer.wait_closed()
 
-    log.debug("Transcript forwarded to orchestrator: %r (satellite=%s)", text, satellite_ip)
+    log.debug(
+        "Transcript forwarded to orchestrator: %r (satellite=%s, user=%s, confidence=%.3f)",
+        text, satellite_ip, user_id, user_confidence,
+    )
 
 # ---------------------------------------------------------------------------
 # Per-connection handler
@@ -117,6 +189,8 @@ async def handle_connection(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
     model: WhisperModel,
+    speaker_model: EncoderClassifier,
+    voice_profiles: dict[str, np.ndarray],
 ) -> None:
     """
     Handle one satellite connection from open to close.
@@ -161,13 +235,29 @@ async def handle_connection(
                     language="en",
                 )
                 transcript = (" ".join(seg.text.strip() for seg in segments).strip(), peer)
+
+                # Speaker ID — reuse the same wav_bytes built for Whisper above.
+                # speechbrain's EncoderClassifier.load_audio() only accepts a
+                # real filesystem path (it does str(path) internally and hands
+                # that to soundfile) — it does NOT accept a BytesIO, despite
+                # looking like it should. Decode the WAV ourselves and hand
+                # encode_batch() a tensor directly, skipping load_audio entirely.
+                audio_np, _ = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+                signal = torch.from_numpy(audio_np).unsqueeze(0)  # (1, samples)
+                embedding = speaker_model.encode_batch(signal).squeeze().numpy()
+                user_id, user_confidence = identify_speaker(embedding, voice_profiles)
                 # -----------------------------------------------------------
 
-                log.info("Transcript from %s: %r", transcript[1], transcript[0])
+                log.info(
+                    "Transcript from %s: %r (speaker=%s, confidence=%.3f)",
+                    transcript[1], transcript[0], user_id, user_confidence,
+                )
 
                 # TODO: pass `transcript` to orchestration layer here
                 try:
-                    await forward_transcript(transcript[0], str(peer[0]))
+                    await forward_transcript(
+                        transcript[0], str(peer[0]), user_id, user_confidence
+                    )
                     log.info("Forwarding transcript %s to %r", transcript[0], str(peer[0]))
                 except OSError as exc:
                     log.error("Failed to forward transcript to orchestrator: %s", exc)
@@ -198,10 +288,14 @@ async def handle_connection(
 # Server entry point
 # ---------------------------------------------------------------------------
 
-async def run(model: WhisperModel) -> None:
+async def run(
+    model: WhisperModel,
+    speaker_model: EncoderClassifier,
+    voice_profiles: dict[str, np.ndarray],
+) -> None:
     """Start the TCP server and serve connections indefinitely."""
     server = await asyncio.start_server(
-        lambda r, w: handle_connection(r, w, model),
+        lambda r, w: handle_connection(r, w, model, speaker_model, voice_profiles),
         host=HOST,
         port=PORT,
     )
@@ -232,8 +326,23 @@ if __name__ == "__main__":
     )
     log.info("Model loaded.")
 
+    log.info("Loading speaker-ID model '%s'...", SPEAKER_MODEL_SOURCE)
+    speaker_model = EncoderClassifier.from_hparams(source=SPEAKER_MODEL_SOURCE)
+    log.info("Speaker-ID model loaded.")
+
+    log.info("Loading voice profiles from '%s'...", VOICE_PROFILES_PATH)
     try:
-        asyncio.run(run(model))
+        voice_profiles = load_voice_profiles(VOICE_PROFILES_PATH)
+    except (FileNotFoundError, json.JSONDecodeError):
+        log.exception(
+            "Could not load voice profiles from '%s' — run enroll_speaker.py first.",
+            VOICE_PROFILES_PATH,
+        )
+        sys.exit(1)
+    log.info("Loaded %d voice profile(s): %s", len(voice_profiles), list(voice_profiles))
+
+    try:
+        asyncio.run(run(model, speaker_model, voice_profiles))
     except KeyboardInterrupt:
         log.info("Interrupted — shutting down")
     except Exception:

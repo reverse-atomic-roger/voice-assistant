@@ -15,6 +15,10 @@ Design constraints:
   - Single Python process, single asyncio thread — no locking needed.
   - Expiry is checked lazily on access, not by a background task.
   - Max turns and TTL both enforced. Whichever triggers first wins.
+  - The identified speaker (user_id) is captured from the turn that started
+    the clarification and carried forward, same as target_satellites — if a
+    different household member answers the follow-up, the action still
+    belongs to whoever originally asked.
 
 State lifecycle:
     1. Handler raises ClarificationNeeded(intent, slots, question, missing_slot)
@@ -93,6 +97,15 @@ class ClarificationContext:
                                     # "set a timer in the kitchen" for 5
                                     # minutes" doesn't lose "kitchen" just
                                     # because the duration needed a follow-up.
+    user_id: str = "unknown"       # speaker identified by the STT server's
+                                    # speaker-ID step, for whoever originally
+                                    # asked. Carried across the clarification
+                                    # turn the same way target_satellites is —
+                                    # if someone else answers the follow-up
+                                    # ("for how long?"), the timer still
+                                    # belongs to whoever asked to set it.
+    user_confidence: float = 0.0   # confidence of that original identification,
+                                    # kept alongside user_id for logging/debugging
     turn: int = 0                  # how many clarifying questions have been asked
     created_at: float = field(default_factory=time.monotonic)
 
@@ -115,8 +128,8 @@ def set(satellite_ip: str, ctx: ClarificationContext) -> None:
     """Store a clarification context for a satellite, replacing any previous one."""
     _pending[satellite_ip] = ctx
     log.debug(
-        "Clarification context set for %s: intent=%r missing_slot=%r turn=%d",
-        satellite_ip, ctx.intent, ctx.missing_slot, ctx.turn,
+        "Clarification context set for %s: intent=%r missing_slot=%r turn=%d user=%r",
+        satellite_ip, ctx.intent, ctx.missing_slot, ctx.turn, ctx.user_id,
     )
 
 
