@@ -66,6 +66,7 @@ import conversation_state
 import database
 import intent_router
 from conversation_state import ClarificationNeeded
+from skills import music as music_skill
 from skills.base import SlotSpec, parse_value_string
 from skills.registry import REGISTERED_SKILLS, TRIGGER_HANDLERS
 
@@ -100,6 +101,20 @@ TTS_PORT = 10302
 # Shared by every skill that schedules future events (timers today; alarms,
 # scheduled lights, etc. later) — there's one poller, not one per skill.
 TRIGGER_POLL_INTERVAL = 5
+
+# CONFIGURE: how often presence_pruner() sweeps stale presence data.
+# Kept roughly in line with database.STALE_SECONDS so a dead/out-of-range
+# tag's resolved location doesn't linger far longer than a sighting is
+# considered fresh for.
+PRESENCE_PRUNE_INTERVAL_S = 30
+
+# CONFIGURE: how often media_follow_poller() checks whether any
+# follow-enabled media session needs to move rooms. Combined with
+# database.STALE_SECONDS/MARGIN_DB's own dwell time, total lag before
+# music follows a person into a new room is roughly the sum of both —
+# tune independently: presence hysteresis affects *correctness* of room
+# detection, this affects *responsiveness* of the follow action.
+MEDIA_FOLLOW_POLL_INTERVAL_S = 10
 
 # Clarification timeout and max turns are configured in conversation_state.py.
 # Pre-synthesised response config (RESPONSES_DIR, RESPONSE_FILES) lives in
@@ -620,10 +635,128 @@ async def trigger_poller() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Presence pruning loop
+# ---------------------------------------------------------------------------
+# Silent housekeeping, deliberately its own sibling task rather than folded
+# into trigger_poller() or media_follow_poller() — a bug in presence
+# pruning shouldn't be able to delay a timer announcement or a room move.
+
+async def presence_pruner() -> None:
+    """
+    Background task. Wakes every PRESENCE_PRUNE_INTERVAL_S seconds and
+    calls database.prune_stale_presence() — clearing any resolved location
+    no longer backed by a fresh sighting, and garbage-collecting old raw
+    sightings. See that function's docstring for why staleness is only
+    ever evaluated there, never on the request path.
+
+    Runs for the lifetime of the process. A failed sweep is logged and
+    retried next interval rather than raising — the same fail-open
+    philosophy as trigger_poller().
+    """
+    log.info("Presence pruner started (interval=%ds)", PRESENCE_PRUNE_INTERVAL_S)
+
+    while True:
+        await asyncio.sleep(PRESENCE_PRUNE_INTERVAL_S)
+        try:
+            database.prune_stale_presence()
+        except Exception:
+            log.exception("presence_pruner: sweep failed, will retry")
+
+
+# ---------------------------------------------------------------------------
+# Media-follow polling loop ("follow me" playback)
+# ---------------------------------------------------------------------------
+# Generic-shaped like trigger_poller() (wake, find work, do it, never let
+# one failure stop the rest) but not generic across skills the way triggers
+# are — only one playback-capable skill (skills/music.py) exists today, so
+# this calls into it directly rather than through a registered-handler
+# table. If a second playback backend is ever added, this should grow a
+# TriggerHandler-style registration mechanism instead of an if/elif chain;
+# doing that now, for one implementation, would be speculative.
+
+async def media_follow_poller() -> None:
+    """
+    Background task. Wakes every MEDIA_FOLLOW_POLL_INTERVAL_S seconds and
+    moves each follow-enabled media session to wherever presence currently
+    resolves its owner to.
+
+    Runs for the lifetime of the process. Per-session errors (MPD
+    unreachable, unexpected exception) are logged and skipped — one bad
+    session never blocks reconciliation of the others.
+    """
+    log.info("Media-follow poller started (interval=%ds)", MEDIA_FOLLOW_POLL_INTERVAL_S)
+
+    while True:
+        await asyncio.sleep(MEDIA_FOLLOW_POLL_INTERVAL_S)
+
+        for session in database.get_all_media_sessions():
+            try:
+                await _reconcile_media_session(session)
+            except Exception:
+                log.exception(
+                    "media_follow_poller: failed reconciling session for %s",
+                    session.user_id,
+                )
+
+
+async def _reconcile_media_session(session) -> None:
+    """
+    Decide whether one follow-enabled session needs to move, end, or be
+    left alone, and act on it. Split out from media_follow_poller() so the
+    per-session try/except above wraps one call, not a chunk of loop body.
+    """
+    location = database.get_user_location(session.user_id)
+
+    if location is None:
+        # Presence gone fully unresolved (dead tag battery, out of range
+        # entirely) — don't freeze at the last known room, end the session.
+        log.info("Ending media session for %s: presence unresolved", session.user_id)
+        await music_skill.end_session_playback(session.current_satellite)
+        database.end_media_session(session.user_id)
+        return
+
+    if location == session.current_satellite:
+        return  # already following correctly, nothing to do
+
+    existing = database.get_active_session_at(location)
+    if existing is not None and existing.user_id != session.user_id:
+        # An incoming session never displaces one already active at the
+        # destination — suppress rather than fight over the room. The
+        # moving user's session ends; it does not silently pause and wait
+        # to resume later, since that would be a surprise on its own.
+        log.info(
+            "Suppressing follow for %s into %s: occupied by %s",
+            session.user_id, location, existing.user_id,
+        )
+        await music_skill.end_session_playback(session.current_satellite)
+        database.end_media_session(session.user_id)
+        return
+
+    try:
+        await music_skill.move_session_playback(
+            session.current_satellite, location, session.content_ref,
+        )
+    except ConnectionError:
+        log.error(
+            "Could not move media session for %s from %s to %s — will retry next cycle",
+            session.user_id, session.current_satellite, location,
+        )
+        return  # bookkeeping deliberately NOT updated — retry from the old room next cycle
+
+    database.move_media_session(session.user_id, location)
+
+
+# ---------------------------------------------------------------------------
 # Satellite registry helpers
 # ---------------------------------------------------------------------------
 
 _IP_TO_NAME: dict[str, str] = {ip: name for name, ip in SATELLITES.items()}
+
+# Give skills a way to turn a satellite IP into a spoken room name (e.g.
+# skills/locate.py) without importing this module, which would be
+# circular — every skill is itself imported by this module via
+# skills.registry. See database.py's register_satellite_names() docstring.
+database.register_satellite_names(_IP_TO_NAME)
 
 
 def satellite_name_from_ip(ip: str) -> str | None:
@@ -858,18 +991,26 @@ async def run() -> None:
     addrs = [str(sock.getsockname()) for sock in server.sockets]
     log.info("Orchestrator listening on %s", addrs)
 
-    # Start the trigger poller as a long-lived background task.
+    # Start the trigger poller, plus the two presence/follow-me pollers, as
+    # long-lived background tasks. Three separate tasks rather than one
+    # combined loop — a bug or slow pass in one (e.g. an unreachable MPD
+    # during a room move) can't delay the others.
     poller_task = asyncio.create_task(trigger_poller(), name="trigger-poller")
+    presence_pruner_task = asyncio.create_task(presence_pruner(), name="presence-pruner")
+    media_follow_task = asyncio.create_task(media_follow_poller(), name="media-follow-poller")
+    background_tasks = (poller_task, presence_pruner_task, media_follow_task)
 
     try:
         async with server:
             await server.serve_forever()
     finally:
-        poller_task.cancel()
-        try:
-            await poller_task
-        except asyncio.CancelledError:
-            pass
+        for task in background_tasks:
+            task.cancel()
+        for task in background_tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         database.close()
 
 

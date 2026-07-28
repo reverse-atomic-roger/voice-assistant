@@ -36,14 +36,14 @@ skills never need to think about this at all.
 import inspect
 import logging
 
-from skills import lists, timer, music, unknown
+from skills import lists, locate, timer, music, unknown
 from skills.base import Skill, TriggerHandler
 
 # To enable a shared/community skill:
 #   from skills import play_music
 # ...then add play_music to the list below. Its whole SKILLS list (however
 # many intents it defines) and its TRIGGER (if any) come along for free.
-SKILL_MODULES = [timer, lists, music, unknown]
+SKILL_MODULES = [timer, lists, music, locate, unknown]
 
 log = logging.getLogger(__name__)
 

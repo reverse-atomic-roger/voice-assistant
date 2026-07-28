@@ -37,18 +37,29 @@ Dependencies not needed elsewhere in the assistant:
 music_indexer.py additionally needs librosa + mutagen, but those are NOT
 required just to run the assistant — see that script's docstring.
 
-Every handler below now accepts `user_id` (per the standard Skill handler
-signature) but none of them use it yet — playlists are still shared/
-household-wide, so "play my playlist" resolves the same way regardless of
-who asks. Making playlists genuinely per-person would mean adding an
-owner column to `playlists`, deciding what "my playlist" means when two
-people have separately made one with the same name, and deciding how an
-unidentified speaker's "my" should degrade. That's a real design decision,
-not a signature change, so it's deliberately not done here — this module
-only takes the parameter so its handlers match every other skill's
-signature.
+Every handler below accepts `user_id` (per the standard Skill handler
+signature). Most still ignore it — playlists are shared/household-wide, so
+"play my playlist" resolves the same way regardless of who asks. Making
+playlists genuinely per-person would mean adding an owner column to
+`playlists`, deciding what "my playlist" means when two people have
+separately made one with the same name, and deciding how an unidentified
+speaker's "my" should degrade. That's a real design decision, not a
+signature change, so it's deliberately not done here.
+
+handle_play_music and handle_play_playlist are the exception: they use
+user_id to register a "follow me" media session (database.media_sessions)
+when the request is trustworthy enough — see _maybe_start_follow_session()
+for the preconditions, and database.check_user_at_satellite() for the
+speaker-ID/presence cross-check that guards against following the wrong
+person. This module also owns the actual MPD mechanics for moving a
+session between rooms (move_session_playback) and ending one
+(end_session_playback) — orchestration.py's media_follow_poller calls
+these directly, since this is the only playback-capable skill today; see
+that poller's docstring for why that's a deliberate shortcut rather than a
+generic registration mechanism.
 """
 
+import asyncio
 import difflib
 import json
 import logging
@@ -101,6 +112,15 @@ PLAYLIST_MOOD_LIMIT = 15
 # How much a relative volume request ("turn it up") changes volume by, out
 # of 100, when the user gave no specific amount.
 DEFAULT_VOLUME_STEP = 15
+
+# CONFIGURE: follow-me room-transition behaviour (see move_session_playback
+# and end_session_playback below). Fixed constants for now, same as every
+# other tunable in this file — revisit if real usage says otherwise.
+REWIND_SECONDS = 3        # resume this many seconds before where playback
+                          # left off, so the transition doesn't feel like it
+                          # skipped ahead mid-word/mid-beat.
+FADE_STEPS = 6            # volume steps per fade direction
+FADE_STEP_DELAY_S = 0.15  # delay between steps (~1s total per side)
 
 # ---------------------------------------------------------------------------
 # Storage — owned entirely by this skill module (see database.py's
@@ -399,6 +419,179 @@ def _adjust_volume_on_satellites(delta: int, targets: list[str]) -> int | None:
 
 
 # ---------------------------------------------------------------------------
+# Follow-me media sessions
+# ---------------------------------------------------------------------------
+# This module owns both ends of "follow me": deciding whether a fresh
+# play_music/play_playlist request should register a follow-enabled
+# session (_maybe_start_follow_session, called from those handlers below),
+# and physically moving or ending one when orchestration.py's
+# media_follow_poller decides presence has changed (move_session_playback /
+# end_session_playback, called directly from that poller — see its
+# docstring for why this is a deliberate one-skill shortcut rather than a
+# generic registration mechanism).
+
+def _maybe_start_follow_session(
+    user_id: str, satellite_ip: str, target_satellites: list[str], paths: list[str],
+) -> None:
+    """
+    Register a follow-enabled media session for this playback, if every
+    precondition holds. Never raises — a failed precondition just means
+    ordinary, non-following playback, which has already happened by the
+    time this is called.
+
+    Preconditions, all required:
+      - user_id is a resolved identity ("unknown" means nothing to follow).
+      - The request wasn't explicitly routed elsewhere. "Play in the
+        kitchen" from the living room means the kitchen, not "wherever I
+        go next" — a session is only bound when target_satellites resolved
+        to exactly the origin, i.e. the user named no room at all.
+      - database.check_user_at_satellite() trusts the claimed identity
+        against independent presence data — see that function's docstring
+        for why a mismatch degrades silently rather than erroring.
+      - The origin isn't already occupied by a different user's
+        follow-enabled session — an incoming session never displaces one
+        already there (same policy the poller applies on the move side).
+    """
+    if user_id == "unknown":
+        return
+
+    if target_satellites != [satellite_ip]:
+        log.debug(
+            "Not enabling follow for %s: request explicitly routed to %s",
+            user_id, target_satellites,
+        )
+        return
+
+    check = database.check_user_at_satellite(user_id, satellite_ip)
+    if not check.trusted:
+        log.info("Not enabling follow for %s: %s", user_id, check.reason)
+        return
+
+    existing = database.get_active_session_at(satellite_ip)
+    if existing is not None and existing.user_id != user_id:
+        log.info(
+            "Not enabling follow for %s: %s already has a session at %s",
+            user_id, existing.user_id, satellite_ip,
+        )
+        return
+
+    database.start_media_session(
+        user_id=user_id,
+        content_ref={"paths": paths, "index": 0},
+        satellite_ip=satellite_ip,
+        follow_enabled=True,
+    )
+    log.info("Follow-me session started for %s at %s", user_id, satellite_ip)
+
+
+async def move_session_playback(from_ip: str, to_ip: str, content_ref: dict) -> None:
+    """
+    Move an in-progress follow-me session from one satellite to another:
+    fade out at the old satellite, fade in at the new one, resuming
+    REWIND_SECONDS before the exact position playback was at — a sudden
+    mid-track start is jarring, and a small rewind smooths the transition
+    over without meaningfully repeating content.
+
+    Called only by orchestration.py's media_follow_poller, never from a
+    request handler. Bookkeeping (media_sessions.current_satellite) is the
+    caller's responsibility — see database.move_media_session() — this
+    function only touches MPD.
+
+    Raises ConnectionError if either satellite's MPD can't be reached. The
+    caller decides what that means for the session (today: log and leave
+    bookkeeping unmoved, so the next poll cycle retries from the old room).
+    """
+    paths = content_ref.get("paths", [])
+    index = content_ref.get("index", 0)
+
+    old = mpd.MPDClient()
+    old.timeout = 10
+    try:
+        old.connect(from_ip, MPD_PORT)
+    except (mpd.MPDError, OSError) as exc:
+        raise ConnectionError(f"Could not reach source MPD at {from_ip}: {exc}") from exc
+
+    try:
+        status = old.status()
+        try:
+            elapsed = float(status.get("elapsed", 0) or 0)
+        except (TypeError, ValueError):
+            elapsed = 0.0
+        try:
+            volume = int(status.get("volume", 100) or 100)
+        except (TypeError, ValueError):
+            volume = 100
+        resume_at = max(0.0, elapsed - REWIND_SECONDS)
+
+        for step in range(FADE_STEPS, -1, -1):
+            old.setvol(int(volume * step / FADE_STEPS))
+            await asyncio.sleep(FADE_STEP_DELAY_S)
+        old.stop()
+    finally:
+        old.close()
+        old.disconnect()
+
+    new = mpd.MPDClient()
+    new.timeout = 10
+    try:
+        new.connect(to_ip, MPD_PORT)
+    except (mpd.MPDError, OSError) as exc:
+        raise ConnectionError(f"Could not reach destination MPD at {to_ip}: {exc}") from exc
+
+    try:
+        new.clear()
+        for path in paths:
+            new.add(path)
+        new.setvol(0)
+        new.play(index)
+        new.seekcur(resume_at)
+        for step in range(FADE_STEPS + 1):
+            new.setvol(int(volume * step / FADE_STEPS))
+            await asyncio.sleep(FADE_STEP_DELAY_S)
+    finally:
+        new.close()
+        new.disconnect()
+
+    log.info(
+        "Media session moved: %s -> %s (resumed at %.1fs, rewound %ds)",
+        from_ip, to_ip, resume_at, REWIND_SECONDS,
+    )
+
+
+async def end_session_playback(satellite_ip: str) -> None:
+    """
+    Fade out and stop whatever's playing at satellite_ip because its
+    follow-me session is ending (presence lost, or suppressed by a
+    conflict with another user's session there).
+
+    Deliberately never raises — a failure reaching MPD here just means the
+    audio keeps playing a little longer than intended at a room that's
+    probably unreachable anyway, which is a much smaller problem than
+    crashing the poller over it.
+    """
+    client = mpd.MPDClient()
+    client.timeout = 10
+    try:
+        client.connect(satellite_ip, MPD_PORT)
+    except (mpd.MPDError, OSError) as exc:
+        log.error("Could not reach MPD at %s to end session: %s", satellite_ip, exc)
+        return
+
+    try:
+        try:
+            volume = int(client.status().get("volume", 100) or 100)
+        except (TypeError, ValueError):
+            volume = 100
+        for step in range(FADE_STEPS, -1, -1):
+            client.setvol(int(volume * step / FADE_STEPS))
+            await asyncio.sleep(FADE_STEP_DELAY_S)
+        client.stop()
+    finally:
+        client.close()
+        client.disconnect()
+
+
+# ---------------------------------------------------------------------------
 # Playlist persistence
 # ---------------------------------------------------------------------------
 
@@ -541,6 +734,8 @@ async def handle_play_music(slots: dict, satellite_ip: str, target_satellites: l
         log.error("Could not reach MPD on any of %s", target_satellites)
         return "I found that track but couldn't reach the music player."
 
+    _maybe_start_follow_session(user_id, satellite_ip, target_satellites, [track["path"]])
+
     label = f"{track['title']} by {track['artist']}" if track["artist"] else track["title"]
     log.info("Playing track id=%d path=%r", track["id"], track["path"])
     return f"Playing {label}."
@@ -602,6 +797,8 @@ async def handle_play_playlist(slots: dict, satellite_ip: str, target_satellites
     except ConnectionError:
         log.error("Could not reach MPD on any of %s", target_satellites)
         return "I found that playlist but couldn't reach the music player."
+
+    _maybe_start_follow_session(user_id, satellite_ip, target_satellites, paths)
 
     count = len(paths)
     log.info("Playing playlist: name=%r tracks=%d", name, count)
