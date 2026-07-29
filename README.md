@@ -48,6 +48,19 @@ pip install -r requirements.txt
 
 Create or acquire some appropriate ONNX voice models for speech recognition and generation, and some WAV files to act as acknowledgement and error sounds. Check the `CONFIGURE` constants at the top of each python file to point to the correct model files, and change IP addresses if needed for multi-device setups.
 
+## A note on `wakeword/requirements-core.txt`
+
+`wakeword/` has two requirements files. `requirements.txt` is the one to
+actually install from — it's current and complete. `requirements-core.txt`
+is a leftover from an earlier dependency conflict between some of the
+audio/ML libraries in that folder, split out at the time as a
+leaner "just the essentials" set; once the conflict was resolved the two
+were merged back into a single `requirements.txt`, and `requirements-core.txt`
+has been unused since. It's being kept around rather than deleted in case
+that conflict — or a similar one — resurfaces on a different platform, so
+don't be surprised to find it there unreferenced; it's not a second install
+step.
+
 ## Entry points
 
 Each folder has one python file containing the main code:

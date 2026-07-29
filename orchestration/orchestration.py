@@ -78,6 +78,16 @@ from skills.registry import REGISTERED_SKILLS, TRIGGER_HANDLERS
 HOST = "127.0.0.1"
 PORT = 10301
 
+# CONFIGURE: address and port satellites connect to for the persistent
+# satellite link (presence reports today — see satellite_link.py on the
+# satellite side, and handle_satellite_link_connection() below). A
+# separate listener from HOST/PORT above on purpose: that one speaks
+# Wyoming events and is only ever contacted by the STT server (hence
+# defaulting to loopback); this one is satellite-initiated, from real
+# devices elsewhere on the network, so it needs to bind every interface.
+SATELLITE_LINK_HOST = "0.0.0.0"
+SATELLITE_LINK_PORT = 10303
+
 # CONFIGURE: satellite name → IP address mapping
 # Assign static DHCP leases to your Pis so these don't drift.
 SATELLITES: dict[str, str] = {
@@ -941,6 +951,89 @@ async def handle_connection(
 
 
 # ---------------------------------------------------------------------------
+# Satellite link — persistent satellite-initiated connection
+# ---------------------------------------------------------------------------
+# Unlike handle_connection() above (one Wyoming event per STT connection,
+# opened and closed per transcript), this is long-lived: a satellite opens
+# one connection at startup (see wakeword/satellite_link.py) and keeps it
+# open for as long as it's running, sending one newline-delimited JSON
+# message per line. Reconnection on drop is entirely the satellite's
+# responsibility.
+
+async def handle_satellite_link_connection(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+) -> None:
+    """
+    Handle one persistent connection from a satellite's satellite_link
+    module.
+
+    Messages are dispatched by their "type" field. Only "presence" exists
+    today; an unrecognised type is logged and ignored rather than closing
+    the connection — this keeps an older orchestrator forward-compatible
+    with a satellite that's been upgraded to send a newer message type
+    (e.g. a future on-device screen's status), and vice versa. Likewise, a
+    single malformed line is logged and skipped rather than dropping the
+    whole connection over one bad message.
+    """
+    peer = writer.get_extra_info("peername")
+    satellite_ip = peer[0] if peer else None
+    log.info("Satellite link connected from %s", satellite_ip)
+
+    try:
+        while True:
+            line = await reader.readline()
+            if not line:
+                break  # satellite closed the connection
+
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                log.warning("Malformed satellite link message from %s: %r", satellite_ip, line)
+                continue
+
+            msg_type = message.get("type") if isinstance(message, dict) else None
+            if msg_type == "presence":
+                _handle_presence_message(satellite_ip, message)
+            else:
+                log.debug(
+                    "Unrecognised satellite link message type %r from %s — ignoring",
+                    msg_type, satellite_ip,
+                )
+
+    except (ConnectionResetError, asyncio.IncompleteReadError):
+        log.warning("Satellite link from %s dropped unexpectedly", satellite_ip)
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        log.info("Satellite link disconnected from %s", satellite_ip)
+
+
+def _handle_presence_message(satellite_ip: str, message: dict) -> None:
+    """
+    One BLE sighting: {"type": "presence", "user_id": ..., "rssi": ...}.
+
+    satellite_ip comes from the connection's peer address, not the message
+    body — the transport already knows this reliably, and a satellite
+    self-reporting its own IP could be wrong (multiple interfaces, NAT).
+    """
+    user_id = message.get("user_id")
+    rssi = message.get("rssi")
+
+    if not isinstance(user_id, str) or not user_id:
+        log.warning("Presence message from %s missing/invalid user_id: %r", satellite_ip, message)
+        return
+    if not isinstance(rssi, (int, float)):
+        log.warning("Presence message from %s missing/invalid rssi: %r", satellite_ip, message)
+        return
+
+    database.update_presence(user_id, satellite_ip, int(rssi))
+
+
+# ---------------------------------------------------------------------------
 # Startup checks
 # ---------------------------------------------------------------------------
 
@@ -989,7 +1082,13 @@ async def run() -> None:
 
     server = await asyncio.start_server(handle_connection, host=HOST, port=PORT)
     addrs = [str(sock.getsockname()) for sock in server.sockets]
-    log.info("Orchestrator listening on %s", addrs)
+    log.info("Orchestrator listening on %s (STT)", addrs)
+
+    satellite_link_server = await asyncio.start_server(
+        handle_satellite_link_connection, host=SATELLITE_LINK_HOST, port=SATELLITE_LINK_PORT,
+    )
+    link_addrs = [str(sock.getsockname()) for sock in satellite_link_server.sockets]
+    log.info("Satellite link listening on %s", link_addrs)
 
     # Start the trigger poller, plus the two presence/follow-me pollers, as
     # long-lived background tasks. Three separate tasks rather than one
@@ -1001,8 +1100,11 @@ async def run() -> None:
     background_tasks = (poller_task, presence_pruner_task, media_follow_task)
 
     try:
-        async with server:
-            await server.serve_forever()
+        async with server, satellite_link_server:
+            await asyncio.gather(
+                server.serve_forever(),
+                satellite_link_server.serve_forever(),
+            )
     finally:
         for task in background_tasks:
             task.cancel()

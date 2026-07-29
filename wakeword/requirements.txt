@@ -1,7 +1,9 @@
+bleak==3.0.2
 certifi==2026.6.17
 cffi==2.0.0
 charset-normalizer==3.4.7
 colorama==0.4.6
+dbus-fast==5.0.22
 flatbuffers==25.12.19
 idna==3.18
 joblib==1.5.3

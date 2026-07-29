@@ -3,21 +3,36 @@
 satellite_main.py
 
 Entrypoint for the satellite device. Initialises the shared audio_io module,
-then runs two things concurrently for the lifetime of the process:
+then runs four things concurrently for the lifetime of the process:
 
-    - wakeword_stream.run()   — listens for the wake word, streams commands
-                                 to the STT server, plays capture earcons
-    - audio_receiver.run()    — Wyoming server; plays canned responses now,
-                                 TTS audio later, as sent by orchestration
+    - wakeword_stream.run()    — listens for the wake word, streams commands
+                                  to the STT server, plays capture earcons
+    - audio_receiver.run()     — Wyoming server; plays canned responses now,
+                                  TTS audio later, as sent by orchestration
+    - satellite_link.run()     — persistent connection to orchestration for
+                                  satellite-initiated messages (presence
+                                  reports today; a natural home for other
+                                  satellite-originated messages later)
+    - presence_scanner.run()   — scans for known BLE presence tags and
+                                  reports sightings over satellite_link
 
-Both consume the same audio_io module for capture/playback, so there is
-exactly one PyAudio instance and one serialised output path in this process.
+Both audio-related tasks consume the same audio_io module for
+capture/playback, so there is exactly one PyAudio instance and one
+serialised output path in this process.
 
 This is the boundary where startup failures and shutdown are handled — the
-two run() functions raise freely; this module is what catches and logs.
+first two run() functions raise freely; this module is what catches and
+logs. satellite_link.run() and presence_scanner.run() are different: they
+are designed to never raise (see their own docstrings) — a satellite with
+no working Bluetooth adapter, or no network path to orchestration, should
+still handle wake word and audio normally, so their failures are logged
+and retried internally rather than propagating into this TaskGroup. They
+are added to the same TaskGroup as the other two purely so the whole
+process still shuts down together on Ctrl-C / SIGTERM, not because a
+failure in one is meant to bring down the others.
 
 Dependencies:
-    pip install openwakeword pyaudio wyoming py-silero-vad-lite soundfile numpy
+    pip install openwakeword pyaudio wyoming py-silero-vad-lite soundfile numpy bleak
 """
 
 import asyncio
@@ -26,6 +41,8 @@ import sys
 
 import audio_io
 import audio_receiver
+import presence_scanner
+import satellite_link
 import wakeword_stream
 
 log = logging.getLogger(__name__)
@@ -34,13 +51,11 @@ log = logging.getLogger(__name__)
 async def main() -> None:
     audio_io.init()
     try:
-        # If either task raises, cancel the other and propagate — a dead
-        # wakeword loop or a dead audio receiver both mean the satellite is
-        # no longer functional, so there's no good reason to keep one alive
-        # without the other.
         async with asyncio.TaskGroup() as tg:
             tg.create_task(wakeword_stream.run(), name="wakeword")
             tg.create_task(audio_receiver.run(), name="audio_receiver")
+            tg.create_task(satellite_link.run(), name="satellite_link")
+            tg.create_task(presence_scanner.run(), name="presence_scanner")
     finally:
         audio_io.shutdown()
 
