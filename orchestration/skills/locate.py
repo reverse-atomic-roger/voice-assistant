@@ -94,8 +94,9 @@ SKILL_LOCATE_USER = Skill(
     prompt_block=PROMPT_BLOCK,
     handler=handle,
     router_hint=(
-        "Find out what room a person is currently in, including asking "
-        "where the speaker themself currently is."
+        "Find out where a person is"
+        "Locate a user"
+        "Where am I?"
     ),
     slot_specs={
         "target_user": SlotSpec(
